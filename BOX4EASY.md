@@ -1,57 +1,60 @@
-# Box4Easy v0.2 alpha
+# Box4Easy v1.0 RC1
 
-Box4Easy is a simplified WebUI and profile layer on top of Box4Magisk/Box4KernelSU.
+Box4Easy is a root transparent-proxy layer for Magisk/KernelSU/APatch with a Material You WebUI. The normal flow is sing-box-first and does not depend on the old Clash/Mihomo node page.
 
-## Main flow
+## What changed after the alpha
 
-1. Pick a core. `sing-box` is the default and recommended option.
-2. Paste a subscription URL or one/more server URIs.
-3. Press **Съесть и применить**.
-4. Pick a subscription group/node, routing profile, or build a multi-hop chain.
-5. Advanced Box4Magisk settings remain available in the existing tabs.
+The alpha was not safe enough: importing could trigger core/network changes too early, the WebUI could wait on long downloads, and the node list depended on Clash API. RC1 replaces that flow.
+
+- Subscription import is transactional: download and parse first; TPROXY is touched only after a supported payload exists and the generated core config validates.
+- A failed core start triggers a fail-safe that stops TPROXY, so Wi-Fi/mobile traffic is not intentionally left pointed at a dead listener.
+- Nodes and latency tests come from Box4Easy state, not the legacy Clash page.
+- WebUI is Russian Material You: Home, Servers, Routing, Apps, Settings.
+- `sing-box` and Xray are installed directly from their official release repositories. V2Ray is installed independently as well. Mihomo is only the legacy Clash/YAML fallback.
 
 ## Subscription formats
 
-The helper currently recognizes:
+- VLESS, VMess, Trojan, Hysteria2/Hy2, Shadowsocks and SOCKS URIs.
+- Plain and Base64 URI subscriptions.
+- sing-box JSON, including `outbounds`.
+- Xray/V2Ray JSON, including `outbounds`.
+- JSON arrays/wrappers containing proxy objects or URI strings.
+- Clash/Mihomo YAML only when Mihomo is explicitly selected.
+- Happ-compatible routing metadata: `routing` header and `happ://routing/add/...`, `happ://routing/onadd/...`, `happ://routing/off` in subscription bodies.
+- Common subscription metadata such as profile title, traffic/expiry info, announcement, support URL, update interval and ping-on-open hints.
 
-- URI lists and base64 URI lists: VLESS, VMess, Trojan, Hysteria2, Shadowsocks, SOCKS.
-- sing-box JSON profiles (`outbounds`).
-- Xray/V2Ray JSON profiles (`outbounds`).
-- Mihomo/Clash YAML as a legacy fallback.
-- Happ `happ://routing/add/...` and `happ://routing/onadd/...` metadata in headers or subscription bodies.
+Format negotiation tries Happ/sing-box/V2Ray-style User-Agents before the legacy Clash fallback. For providers that require device metadata, Box4Easy may send the device's real stable Android ID/model/OS as compatibility headers. It does not randomize or rotate identity to evade provider device limits.
 
-The importer tries sing-box/V2Ray-style User-Agents before falling back to Clash YAML, because many panels change the returned format based on the client UA.
+## Servers and latency
 
-## Core selection
+The Servers tab is independent of Clash API. Every imported node is visible in its subscription group. The UI can test one server or all servers using a short TCP-connect latency probe and select a concrete node for the active core.
 
-- **sing-box** — default. Supports generated selector/urltest groups, Clash API, Hysteria2 and multi-hop `detour` chains.
-- **Xray** — VLESS/VMess/Trojan/Shadowsocks/SOCKS and native Xray JSON outbounds. Chains use `proxySettings`.
-- **V2Ray** — uses the V2Fly core and Xray-compatible generated JSON for common protocols. The helper can install the latest Android V2Ray release if missing.
-- **Mihomo** — retained for Clash/YAML subscriptions and compatibility. It is not the primary Easy Mode path.
+## Cores
 
-A subscription can contain nodes that are only compatible with one core. The UI filters chain choices by the active core; unsupported nodes are skipped by the generator.
+- **sing-box** — default and recommended; JSON, Hysteria2, selector/urltest and multi-hop `detour`.
+- **Xray** — VLESS/VMess/Trojan/Shadowsocks/SOCKS, Reality and Xray JSON; chains use `proxySettings`.
+- **V2Ray** — V2Fly compatibility for common Xray-style generated configs.
+- **Mihomo** — legacy Clash/YAML compatibility only.
 
-## Multi-hop chains
+Unsupported nodes are shown but disabled for the selected core instead of silently disappearing.
 
-The Easy tab can build:
+## Root networking
 
-`device -> A -> B -> Internet`
+The default transparent mode is TPROXY on port 1536, with DNS interception configurable separately. REDIRECT remains available as a fallback. Box4Easy does not need Android `VpnService` for the normal root flow.
 
-where A and B may come from different subscriptions. For sing-box, hop B gets `detour: A`. For Xray/V2Ray, hop B gets `proxySettings.tag = A`.
+The queued service launcher starts the core before applying TPROXY and performs a second health check after startup. If the core dies immediately, it removes TPROXY and stops the service.
 
-## Source layout
+## Multi-hop
 
-`tools/box4easy/source/main.go.part.*` contains the helper source in transport-friendly chunks. `tools/box4easy/materialize.sh` concatenates them into the ignored generated `main.go` before tests/builds. CI then runs `go test`, `go vet` and cross-builds static helpers for arm64, armv7, x86_64 and x86.
-
-## Safety / entitlement boundary
-
-Box4Easy does not spoof or rotate provider HWID/device identifiers to evade device limits or unlock paid entitlements. Compatibility metadata such as User-Agent can be varied for format negotiation, but not to bypass subscription authorization.
+The Routing tab can create `device -> A -> B -> Internet`, including nodes from different subscriptions. sing-box uses `detour`; Xray/V2Ray use `proxySettings`.
 
 ## Validation
 
-- Local `go test ./...` passes.
-- Local `go vet ./...` passes.
-- Helper cross-build succeeds for arm64, armv7, x86_64 and x86.
-- Tests cover common URI parsing, base64 subscriptions, Happ routing, sing-box JSON import, sing-box config generation and a two-hop detour chain.
+Local development checks for RC1:
 
-A rooted Android smoke test is still required before calling this stable: startup, TPROXY/DNS behavior, core-specific config validation and real provider responses need on-device testing.
+- `go test ./...`
+- `go vet ./...`
+- static cross-build for arm64, armv7, x86_64 and x86
+- strict TypeScript check for the rewritten Material You UI
+
+GitHub Actions additionally builds the real WebUI/module and verifies the flashable ZIP contents. RC1 still requires a rooted-device smoke test before promotion to stable v1.0.0.
