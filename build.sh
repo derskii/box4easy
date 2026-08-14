@@ -1,3 +1,4 @@
 #!/bin/sh
-
-zip -r -o -X -ll box4_$(cat module.prop | grep 'version=' | awk -F '=' '{print $2}').zip ./ -x '.git/*' -x 'build.sh' -x '.github/*' -x 'box4.json' -x 'webui/*' -x 'ui.ts'
+set -e
+zip -r -o -X -ll "box4easy_$(grep '^version=' module.prop | awk -F '=' '{print $2}').zip" ./ \
+  -x '.git/*' -x 'build.sh' -x '.github/*' -x 'box4.json' -x 'webui/*' -x 'tools/*' -x 'ui.ts'
