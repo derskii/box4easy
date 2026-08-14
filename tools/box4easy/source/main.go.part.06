@@ -1,0 +1,394 @@
+		appendClass("BlockSites", "BlockIp", "", true)
+	}
+	if !seen["proxy"] {
+		appendClass("ProxySites", "ProxyIp", "PROXY", false)
+	}
+	if !seen["direct"] {
+		appendClass("DirectSites", "DirectIp", "DIRECT", false)
+	}
+	return rules, sets
+}
+
+func xrayOutboundFromNode(n ServerEntry, tag string) (map[string]interface{}, error) {
+	if n.RawKind == "xray" && n.Raw != nil {
+		m := cloneMap(n.Raw)
+		m["tag"] = tag
+		return m, nil
+	}
+	if n.RawKind == "sing-box" {
+		return nil, errors.New("sing-box-only JSON node cannot be used by Xray/V2Ray")
+	}
+	p := n.Proxy
+	if p == nil {
+		return nil, errors.New("empty node")
+	}
+	typ := strings.ToLower(stringValue(p["type"]))
+	server := stringValue(p["server"])
+	port := intValue(p["port"])
+	m := map[string]interface{}{"tag": tag}
+	switch typ {
+	case "vless":
+		user := map[string]interface{}{"id": stringValue(p["uuid"]), "encryption": "none"}
+		if flow := stringValue(p["flow"]); flow != "" {
+			user["flow"] = flow
+		}
+		m["protocol"] = "vless"
+		m["settings"] = map[string]interface{}{"vnext": []interface{}{map[string]interface{}{"address": server, "port": port, "users": []interface{}{user}}}}
+		m["streamSettings"] = xrayStreamSettings(p, true)
+	case "vmess":
+		user := map[string]interface{}{"id": stringValue(p["uuid"]), "security": "auto"}
+		if aid := intValue(p["alterId"]); aid != 0 {
+			user["alterId"] = aid
+		}
+		m["protocol"] = "vmess"
+		m["settings"] = map[string]interface{}{"vnext": []interface{}{map[string]interface{}{"address": server, "port": port, "users": []interface{}{user}}}}
+		m["streamSettings"] = xrayStreamSettings(p, false)
+	case "trojan":
+		m["protocol"] = "trojan"
+		m["settings"] = map[string]interface{}{"servers": []interface{}{map[string]interface{}{"address": server, "port": port, "password": stringValue(p["password"])}}}
+		m["streamSettings"] = xrayStreamSettings(p, true)
+	case "ss":
+		m["protocol"] = "shadowsocks"
+		m["settings"] = map[string]interface{}{"servers": []interface{}{map[string]interface{}{"address": server, "port": port, "method": stringValue(p["cipher"]), "password": stringValue(p["password"])}}}
+	case "socks5", "socks":
+		srv := map[string]interface{}{"address": server, "port": port}
+		if u := stringValue(p["username"]); u != "" {
+			srv["users"] = []interface{}{map[string]interface{}{"user": u, "pass": stringValue(p["password"])}}
+		}
+		m["protocol"] = "socks"
+		m["settings"] = map[string]interface{}{"servers": []interface{}{srv}}
+	case "hysteria2":
+		return nil, errors.New("Hysteria2 is not supported by Xray/V2Ray core")
+	default:
+		return nil, fmt.Errorf("protocol %s is not supported by Xray generator", typ)
+	}
+	return m, nil
+}
+
+func xrayStreamSettings(p map[string]interface{}, forceTLS bool) map[string]interface{} {
+	s := map[string]interface{}{}
+	netw := strings.ToLower(stringValue(p["network"]))
+	if netw != "" {
+		if netw == "http" {
+			netw = "xhttp"
+		}
+		s["network"] = netw
+	}
+	if forceTLS || boolish(p["tls"], false) || p["reality-opts"] != nil {
+		if ro, ok := p["reality-opts"].(map[string]interface{}); ok && len(ro) > 0 {
+			s["security"] = "reality"
+			rs := map[string]interface{}{}
+			if v := firstNonEmpty(stringValue(p["servername"]), stringValue(p["sni"])); v != "" {
+				rs["serverName"] = v
+			}
+			if v := stringValue(ro["public-key"]); v != "" {
+				rs["fingerprint"] = firstNonEmpty(stringValue(p["client-fingerprint"]), "chrome")
+				rs["publicKey"] = v
+			}
+			if v := stringValue(ro["short-id"]); v != "" {
+				rs["shortId"] = v
+			}
+			s["realitySettings"] = rs
+		} else {
+			s["security"] = "tls"
+			ts := map[string]interface{}{}
+			if v := firstNonEmpty(stringValue(p["servername"]), stringValue(p["sni"])); v != "" {
+				ts["serverName"] = v
+			}
+			if boolish(p["skip-cert-verify"], false) {
+				ts["allowInsecure"] = true
+			}
+			if v := stringValue(p["client-fingerprint"]); v != "" {
+				ts["fingerprint"] = v
+			}
+			s["tlsSettings"] = ts
+		}
+	}
+	if netw == "ws" {
+		if o, ok := p["ws-opts"].(map[string]interface{}); ok {
+			ws := map[string]interface{}{}
+			if v := o["path"]; v != nil {
+				ws["path"] = v
+			}
+			if h, ok := o["headers"].(map[string]interface{}); ok {
+				ws["headers"] = h
+			}
+			s["wsSettings"] = ws
+		}
+	}
+	if netw == "grpc" {
+		if o, ok := p["grpc-opts"].(map[string]interface{}); ok {
+			s["grpcSettings"] = map[string]interface{}{"serviceName": stringValue(o["grpc-service-name"])}
+		}
+	}
+	return s
+}
+
+func rebuildXrayConfig(dir string, st State, core string) error {
+	used := map[string]int{}
+	out := []interface{}{map[string]interface{}{"protocol": "freedom", "tag": "DIRECT"}, map[string]interface{}{"protocol": "blackhole", "tag": "BLOCK"}}
+	refTags := map[string]string{}
+	var usable []string
+	for _, item := range allNodes(st) {
+		tag := uniqueTag(item.Group+" · "+item.Node.Name, used)
+		o, err := xrayOutboundFromNode(item.Node, tag)
+		if err != nil {
+			continue
+		}
+		out = append(out, o)
+		refTags[item.Ref] = tag
+		usable = append(usable, tag)
+	}
+	var chainTags []string
+	for _, ch := range st.Chains {
+		if !ch.Enabled || len(ch.Hops) < 2 {
+			continue
+		}
+		prev := ""
+		ok := true
+		for i, ref := range ch.Hops {
+			n, ex := resolveNodeRef(st, ref)
+			if !ex {
+				ok = false
+				break
+			}
+			tag := uniqueTag(fmt.Sprintf("CHAIN · %s · %d", ch.Name, i+1), used)
+			o, err := xrayOutboundFromNode(n, tag)
+			if err != nil {
+				ok = false
+				break
+			}
+			if prev != "" {
+				o["proxySettings"] = map[string]interface{}{"tag": prev, "transportLayer": true}
+			}
+			out = append(out, o)
+			prev = tag
+		}
+		if ok && prev != "" {
+			refTags[chainRef(ch.ID)] = prev
+			chainTags = append(chainTags, prev)
+		}
+	}
+	usable = append(usable, chainTags...)
+	selected := ""
+	if st.SelectedNode != "" {
+		selected = refTags[st.SelectedNode]
+	}
+	if selected == "" && len(usable) > 0 {
+		selected = usable[0]
+	}
+	if st.Mode == "direct" {
+		selected = "DIRECT"
+	}
+	if selected == "" {
+		selected = "DIRECT"
+	}
+	rules := xrayRouteRules(st, selected)
+	cfg := map[string]interface{}{"log": map[string]interface{}{"loglevel": "warning"}, "dns": map[string]interface{}{"servers": []string{"1.1.1.1", "8.8.8.8"}}, "inbounds": []interface{}{map[string]interface{}{"tag": "tproxy-in", "listen": "0.0.0.0", "port": 1536, "protocol": "dokodemo-door", "settings": map[string]interface{}{"network": "tcp,udp", "followRedirect": true}, "sniffing": map[string]interface{}{"enabled": true, "destOverride": []string{"http", "tls", "quic"}}, "streamSettings": map[string]interface{}{"sockopt": map[string]interface{}{"tproxy": "tproxy"}}}}, "outbounds": out, "routing": map[string]interface{}{"domainStrategy": "IPIfNonMatch", "rules": rules}}
+	b, _ := json.MarshalIndent(cfg, "", "  ")
+	target := xrayConfigPath(core)
+	old, _ := os.ReadFile(target)
+	if err := atomicWrite(target, append(b, '\n'), 0644); err != nil {
+		return err
+	}
+	if err := validateJSONCoreConfig(core, target); err != nil {
+		if len(old) > 0 {
+			_ = atomicWrite(target, old, 0644)
+		}
+		return fmt.Errorf("%s config validation failed: %w", core, err)
+	}
+	return nil
+}
+
+func xrayRouteRules(st State, selected string) []interface{} {
+	var rules []interface{}
+	if st.Mode != "routing" {
+		rules = append(rules, map[string]interface{}{"type": "field", "network": "tcp,udp", "outboundTag": selected})
+		return rules
+	}
+	idx := findRouting(st.Routings, st.ActiveRouting)
+	if idx < 0 {
+		rules = append(rules, map[string]interface{}{"type": "field", "ip": []string{"geoip:private"}, "outboundTag": "DIRECT"}, map[string]interface{}{"type": "field", "network": "tcp,udp", "outboundTag": selected})
+		return rules
+	}
+	var r map[string]interface{}
+	if json.Unmarshal(st.Routings[idx].Raw, &r) != nil {
+		return []interface{}{map[string]interface{}{"type": "field", "network": "tcp,udp", "outboundTag": selected}}
+	}
+	appendClass := func(siteKey, ipKey, outbound string, block bool) {
+		domains := []string{}
+		ips := []string{}
+		for _, x := range stringSlice(firstInterface(r, siteKey, lowerFirst(siteKey))) {
+			x = strings.TrimSpace(x)
+			if x == "" {
+				continue
+			}
+			if strings.HasPrefix(strings.ToLower(x), "geosite:") {
+				domains = append(domains, x)
+			} else if strings.HasPrefix(x, "+.") {
+				domains = append(domains, "domain:"+strings.TrimPrefix(x, "+."))
+			} else {
+				domains = append(domains, "domain:"+strings.TrimPrefix(x, "."))
+			}
+		}
+		for _, x := range stringSlice(firstInterface(r, ipKey, lowerFirst(ipKey))) {
+			x = strings.TrimSpace(x)
+			if x != "" {
+				ips = append(ips, x)
+			}
+		}
+		if len(domains) > 0 || len(ips) > 0 {
+			rule := map[string]interface{}{"type": "field"}
+			if len(domains) > 0 {
+				rule["domain"] = domains
+			}
+			if len(ips) > 0 {
+				rule["ip"] = ips
+			}
+			if block {
+				rule["outboundTag"] = "BLOCK"
+			} else {
+				rule["outboundTag"] = outbound
+			}
+			rules = append(rules, rule)
+		}
+	}
+	appendClass("DirectSites", "DirectIp", "DIRECT", false)
+	appendClass("ProxySites", "ProxyIp", selected, false)
+	appendClass("BlockSites", "BlockIp", "BLOCK", true)
+	global := boolish(firstInterface(r, "GlobalProxy", "globalProxy"), true)
+	if global {
+		rules = append(rules, map[string]interface{}{"type": "field", "network": "tcp,udp", "outboundTag": selected})
+	} else {
+		rules = append(rules, map[string]interface{}{"type": "field", "network": "tcp,udp", "outboundTag": "DIRECT"})
+	}
+	return rules
+}
+
+func validateJSONCoreConfig(core, path string) error {
+	bin := filepath.Join(boxRoot(), "bin", core)
+	if _, err := os.Stat(bin); err != nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	var cmd *exec.Cmd
+	switch core {
+	case "sing-box":
+		cmd = exec.CommandContext(ctx, bin, "check", "-c", path)
+	case "xray":
+		cmd = exec.CommandContext(ctx, bin, "-test", "-confdir", filepath.Dir(path))
+	case "v2ray":
+		cmd = exec.CommandContext(ctx, bin, "test", "-d", filepath.Dir(path))
+	default:
+		return fmt.Errorf("unsupported JSON core: %s", core)
+	}
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return errors.New("validation timed out")
+	}
+	if err != nil {
+		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func rebuildMihomoConfig(dir string, st State) error {
+	var b strings.Builder
+	b.WriteString("# Generated by Box4Easy. Disable Easy Mode to restore the previous Mihomo config.\n")
+	b.WriteString("mixed-port: 7890\nredir-port: 7891\ntproxy-port: 1536\n")
+	b.WriteString("ipv6: false\nallow-lan: true\nunified-delay: true\ntcp-concurrent: true\n")
+	port, secret := readClashAPIConfig()
+	fmt.Fprintf(&b, "external-controller: 127.0.0.1:%s\n", port)
+	if secret != "" {
+		fmt.Fprintf(&b, "secret: %s\n", yamlQuote(secret))
+	}
+	b.WriteString("find-process-mode: always\n")
+	b.WriteString("geodata-mode: true\ngeo-auto-update: true\ngeo-update-interval: 24\n")
+	b.WriteString("geox-url:\n  geoip: https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat\n  geosite: https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat\n  mmdb: https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/country.mmdb\n")
+	b.WriteString("profile:\n  store-selected: true\n  store-fake-ip: true\n")
+	b.WriteString("sniffer:\n  enable: true\n  sniff:\n    HTTP:\n      ports: [80, 8080-8880]\n      override-destination: true\n    TLS:\n      ports: [443, 8443]\n    QUIC:\n      ports: [443, 8443]\n")
+	b.WriteString("dns:\n  enable: true\n  listen: 0.0.0.0:1053\n  ipv6: false\n  enhanced-mode: fake-ip\n  fake-ip-range: 198.18.0.0/15\n  fake-ip-filter:\n    - '*'\n    - '+.lan'\n    - '+.local'\n  default-nameserver:\n    - 1.1.1.1\n    - 8.8.8.8\n  nameserver:\n    - https://cloudflare-dns.com/dns-query\n    - https://dns.google/dns-query\n")
+
+	b.WriteString("proxy-providers:\n")
+	compatibleMihomoSubs := 0
+	for _, sub := range st.Subscriptions {
+		if strings.Contains(strings.ToLower(sub.SourceFormat), "json") {
+			continue
+		}
+		compatibleMihomoSubs++
+		key := providerKey(sub.ID)
+		fmt.Fprintf(&b, "  %s:\n", yamlQuote(key))
+		if sub.ProviderKind == "file" {
+			rel := filepath.ToSlash(sub.ProviderPath)
+			fmt.Fprintf(&b, "    type: file\n    path: %s\n", yamlQuote(rel))
+		} else {
+			fmt.Fprintf(&b, "    type: http\n    url: %s\n    path: %s\n    interval: 3600\n", yamlQuote(sub.URL), yamlQuote("./providers/"+safeID(sub.ID)+".yaml"))
+			fmt.Fprintf(&b, "    header:\n      User-Agent:\n        - %s\n", yamlQuote(sub.UserAgent))
+		}
+		fmt.Fprintf(&b, "    override:\n      additional-prefix: %s\n", yamlQuote("["+sub.Name+"] "))
+		b.WriteString("    health-check:\n      enable: true\n      url: https://www.gstatic.com/generate_204\n      interval: 300\n      timeout: 5000\n      lazy: true\n")
+	}
+	if compatibleMihomoSubs == 0 {
+		b.WriteString("  {}\n")
+	}
+
+	b.WriteString("proxies:\n")
+	b.WriteString("  - {\"name\":\"DIRECT-LOCAL\",\"type\":\"direct\",\"udp\":true}\n")
+	for _, srv := range st.Servers {
+		p := cloneMap(srv.Proxy)
+		p["name"] = "[Local] " + srv.Name
+		j, _ := json.Marshal(p)
+		b.WriteString("  - ")
+		b.Write(j)
+		b.WriteByte('\n')
+	}
+
+	subGroupNames := make([]string, 0, len(st.Subscriptions))
+	for _, sub := range st.Subscriptions {
+		if strings.Contains(strings.ToLower(sub.SourceFormat), "json") {
+			continue
+		}
+		subGroupNames = append(subGroupNames, groupName(sub))
+	}
+	localNames := make([]string, 0, len(st.Servers))
+	for _, srv := range st.Servers {
+		localNames = append(localNames, "[Local] "+srv.Name)
+	}
+
+	b.WriteString("proxy-groups:\n")
+	b.WriteString("  - name: PROXY\n    type: select\n    proxies:\n      - AUTO\n")
+	for _, n := range subGroupNames {
+		fmt.Fprintf(&b, "      - %s\n", yamlQuote(n))
+	}
+	for _, n := range localNames {
+		fmt.Fprintf(&b, "      - %s\n", yamlQuote(n))
+	}
+	b.WriteString("      - DIRECT\n")
+
+	b.WriteString("  - name: AUTO\n    type: url-test\n    url: https://www.gstatic.com/generate_204\n    interval: 300\n    tolerance: 50\n    include-all: true\n")
+	for _, sub := range st.Subscriptions {
+		if strings.Contains(strings.ToLower(sub.SourceFormat), "json") {
+			continue
+		}
+		fmt.Fprintf(&b, "  - name: %s\n    type: select\n    use:\n      - %s\n", yamlQuote(groupName(sub)), yamlQuote(providerKey(sub.ID)))
+	}
+	b.WriteString("  - name: GLOBAL\n    type: select\n    proxies:\n      - PROXY\n      - AUTO\n")
+	for _, n := range subGroupNames {
+		fmt.Fprintf(&b, "      - %s\n", yamlQuote(n))
+	}
+	b.WriteString("      - DIRECT\n")
+
+	b.WriteString("rules:\n")
+	appendRules(&b, st)
+
+	target := mihomoConfigPath()
+	old, _ := os.ReadFile(target)
+	if err := atomicWrite(target, []byte(b.String()), 0644); err != nil {
+		return err
+	}
+	if err := validateMihomoConfig(target); err != nil {
+		if len(old) > 0 {
+			_ = atomicWrite(target, old, 0644)
+		}
+		return fmt.Errorf("mihomo config validation failed: %w", err)

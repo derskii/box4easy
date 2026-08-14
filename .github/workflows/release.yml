@@ -8,9 +8,30 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache-dependency-path: tools/box4easy/go.mod
+
+      - name: Materialize and test Box4Easy helper
+        working-directory: tools/box4easy
+        run: |
+          sh materialize.sh
+          go test ./...
+          go vet ./...
+
+      - name: Build Box4Easy helpers
+        working-directory: tools/box4easy
+        run: |
+          mkdir -p ../../easy-bin
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o ../../easy-bin/box4easy-arm64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -trimpath -ldflags='-s -w' -o ../../easy-bin/box4easy-armv7 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o ../../easy-bin/box4easy-x86_64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=386 go build -trimpath -ldflags='-s -w' -o ../../easy-bin/box4easy-x86 .
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -25,12 +46,12 @@ jobs:
           npm ci
           npm run build
 
-      - name: Run build.sh
+      - name: Build module ZIP
         run: sh build.sh
 
       - name: Upload release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          files: box4_v*.zip
+          files: box4easy_*.zip
           generate_release_notes: true

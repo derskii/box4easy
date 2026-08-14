@@ -8,13 +8,37 @@ on:
       - "README.md"
     tags-ignore:
       - "v*"
+  pull_request:
+    branches:
+      - main
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache-dependency-path: tools/box4easy/go.mod
+
+      - name: Materialize and test Box4Easy helper
+        working-directory: tools/box4easy
+        run: |
+          sh materialize.sh
+          go test ./...
+          go vet ./...
+
+      - name: Build Box4Easy helpers
+        working-directory: tools/box4easy
+        run: |
+          mkdir -p ../../easy-bin
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o ../../easy-bin/box4easy-arm64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -trimpath -ldflags='-s -w' -o ../../easy-bin/box4easy-armv7 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o ../../easy-bin/box4easy-x86_64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=386 go build -trimpath -ldflags='-s -w' -o ../../easy-bin/box4easy-x86 .
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -29,29 +53,11 @@ jobs:
           npm ci
           npm run build
 
-      - name: Run build.sh
+      - name: Build module ZIP
         run: sh build.sh
 
-      - name: Delete current prerelease assets
-        uses: andreaswilli/delete-release-assets-action@v3.0.0
+      - name: Upload module artifact
+        uses: actions/upload-artifact@v4
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          tag: Prerelease
-          deleteOnlyFromDrafts: false
-
-      - name: Tag Repo
-        uses: richardsimko/update-tag@v1
-        with:
-          tag_name: Prerelease
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload Prerelease
-        uses: softprops/action-gh-release@v1
-        if: ${{ success() }}
-        with:
-          tag: Prerelease
-          tag_name: Prerelease
-          files: box4_v*.zip
-          prerelease: true
-          generate_release_notes: true
+          name: box4easy-module
+          path: box4easy_*.zip

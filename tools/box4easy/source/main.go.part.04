@@ -1,0 +1,396 @@
+	}
+	host, port, err := hostPort(u)
+	if err != nil {
+		return nil, err
+	}
+	password := ""
+	if u.User != nil {
+		password = u.User.Username()
+	}
+	if password == "" {
+		return nil, errors.New("trojan password is missing")
+	}
+	q := u.Query()
+	p := map[string]interface{}{"name": nodeName(u, host), "type": "trojan", "server": host, "port": port, "password": password, "udp": true}
+	if sni := firstNonEmpty(q.Get("sni"), q.Get("peer"), q.Get("servername")); sni != "" {
+		p["sni"] = sni
+	}
+	if fp := q.Get("fp"); fp != "" {
+		p["client-fingerprint"] = fp
+	}
+	if q.Get("allowInsecure") == "1" || strings.EqualFold(q.Get("insecure"), "true") {
+		p["skip-cert-verify"] = true
+	}
+	applyTransport(p, q)
+	return p, nil
+}
+
+func parseHysteria2(raw string) (map[string]interface{}, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	host, port, err := hostPort(u)
+	if err != nil {
+		return nil, err
+	}
+	password := ""
+	if u.User != nil {
+		password = u.User.Username()
+		if pw, ok := u.User.Password(); ok && pw != "" {
+			password = pw
+		}
+	}
+	if password == "" {
+		return nil, errors.New("hysteria2 password is missing")
+	}
+	q := u.Query()
+	p := map[string]interface{}{"name": nodeName(u, host), "type": "hysteria2", "server": host, "port": port, "password": password}
+	if sni := q.Get("sni"); sni != "" {
+		p["sni"] = sni
+	}
+	if q.Get("insecure") == "1" || strings.EqualFold(q.Get("insecure"), "true") {
+		p["skip-cert-verify"] = true
+	}
+	if obfs := q.Get("obfs"); obfs != "" {
+		p["obfs"] = obfs
+	}
+	if op := firstNonEmpty(q.Get("obfs-password"), q.Get("obfsPassword")); op != "" {
+		p["obfs-password"] = op
+	}
+	if up := q.Get("up"); up != "" {
+		p["up"] = up
+	}
+	if down := q.Get("down"); down != "" {
+		p["down"] = down
+	}
+	return p, nil
+}
+
+func parseVMess(raw string) (map[string]interface{}, error) {
+	payload := strings.TrimPrefix(raw, "vmess://")
+	payload = strings.TrimSpace(payload)
+	var decoded []byte
+	var err error
+	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+		decoded, err = enc.DecodeString(payload)
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		return nil, errors.New("invalid vmess base64")
+	}
+	var v map[string]interface{}
+	if err := json.Unmarshal(decoded, &v); err != nil {
+		return nil, errors.New("invalid vmess json")
+	}
+	host := firstString(v, "add", "host")
+	id := firstString(v, "id")
+	if host == "" || id == "" {
+		return nil, errors.New("vmess host/id missing")
+	}
+	port, _ := strconv.Atoi(firstString(v, "port"))
+	if port == 0 {
+		port = intValue(v["port"])
+	}
+	if port == 0 {
+		return nil, errors.New("vmess port missing")
+	}
+	name := firstString(v, "ps", "name")
+	if name == "" {
+		name = host
+	}
+	p := map[string]interface{}{"name": name, "type": "vmess", "server": host, "port": port, "uuid": id, "alterId": intValue(v["aid"]), "cipher": "auto", "udp": true}
+	if tls := strings.ToLower(firstString(v, "tls")); tls == "tls" {
+		p["tls"] = true
+	}
+	if sni := firstString(v, "sni", "serverName"); sni != "" {
+		p["servername"] = sni
+	}
+	if fp := firstString(v, "fp"); fp != "" {
+		p["client-fingerprint"] = fp
+	}
+	netType := firstString(v, "net")
+	if netType != "" && netType != "tcp" {
+		p["network"] = netType
+		switch netType {
+		case "ws":
+			opts := map[string]interface{}{}
+			if path := firstString(v, "path"); path != "" {
+				opts["path"] = path
+			}
+			if h := firstString(v, "host"); h != "" {
+				opts["headers"] = map[string]interface{}{"Host": h}
+			}
+			p["ws-opts"] = opts
+		case "grpc":
+			p["grpc-opts"] = map[string]interface{}{"grpc-service-name": firstString(v, "path")}
+		}
+	}
+	return p, nil
+}
+
+func parseSS(raw string) (map[string]interface{}, error) {
+	rest := strings.TrimPrefix(raw, "ss://")
+	frag := ""
+	if i := strings.Index(rest, "#"); i >= 0 {
+		frag, _ = url.QueryUnescape(rest[i+1:])
+		rest = rest[:i]
+	}
+	var userinfo, hostport string
+	if at := strings.LastIndex(rest, "@"); at >= 0 {
+		userinfo, hostport = rest[:at], rest[at+1:]
+		if dec := decodeB64String(userinfo); dec != "" {
+			userinfo = dec
+		}
+	} else {
+		dec := decodeB64String(rest)
+		if dec == "" {
+			return nil, errors.New("invalid ss base64")
+		}
+		at := strings.LastIndex(dec, "@")
+		if at < 0 {
+			return nil, errors.New("invalid ss payload")
+		}
+		userinfo, hostport = dec[:at], dec[at+1:]
+	}
+	c := strings.Index(userinfo, ":")
+	if c < 1 {
+		return nil, errors.New("invalid ss method/password")
+	}
+	method, password := userinfo[:c], userinfo[c+1:]
+	host, portStr, err := net.SplitHostPort(hostport)
+	if err != nil {
+		return nil, err
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, err
+	}
+	if frag == "" {
+		frag = host
+	}
+	return map[string]interface{}{"name": frag, "type": "ss", "server": host, "port": port, "cipher": method, "password": password, "udp": true}, nil
+}
+
+func parseSocks(raw string) (map[string]interface{}, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	host, port, err := hostPort(u)
+	if err != nil {
+		return nil, err
+	}
+	p := map[string]interface{}{"name": nodeName(u, host), "type": "socks5", "server": host, "port": port, "udp": true}
+	if u.User != nil {
+		if user := u.User.Username(); user != "" {
+			p["username"] = user
+		}
+		if pw, ok := u.User.Password(); ok {
+			p["password"] = pw
+		}
+	}
+	return p, nil
+}
+
+func applyTransport(p map[string]interface{}, q url.Values) {
+	network := strings.ToLower(firstNonEmpty(q.Get("type"), q.Get("network")))
+	switch network {
+	case "ws":
+		p["network"] = "ws"
+		opts := map[string]interface{}{}
+		if path := q.Get("path"); path != "" {
+			opts["path"] = path
+		}
+		if h := q.Get("host"); h != "" {
+			opts["headers"] = map[string]interface{}{"Host": h}
+		}
+		if ed := q.Get("ed"); ed != "" {
+			opts["max-early-data"] = toIntOrString(ed)
+		}
+		p["ws-opts"] = opts
+	case "grpc":
+		p["network"] = "grpc"
+		service := firstNonEmpty(q.Get("serviceName"), q.Get("service-name"))
+		p["grpc-opts"] = map[string]interface{}{"grpc-service-name": service}
+	case "http", "h2":
+		p["network"] = "http"
+		opts := map[string]interface{}{}
+		if path := q.Get("path"); path != "" {
+			opts["path"] = []string{path}
+		}
+		if h := q.Get("host"); h != "" {
+			opts["headers"] = map[string]interface{}{"Host": []string{h}}
+		}
+		p["http-opts"] = opts
+	}
+}
+
+func rebuildConfig(dir string, st State) error {
+	core := normalizeCore(st.Core)
+	if core == "" {
+		core = "sing-box"
+	}
+	switch core {
+	case "sing-box":
+		return rebuildSingBoxConfig(dir, st)
+	case "xray", "v2ray":
+		return rebuildXrayConfig(dir, st, core)
+	case "mihomo":
+		return rebuildMihomoConfig(dir, st)
+	default:
+		return fmt.Errorf("unsupported core: %s", st.Core)
+	}
+}
+
+func normalizeCore(core string) string {
+	core = strings.ToLower(strings.TrimSpace(core))
+	switch core {
+	case "singbox", "sing_box", "sing-box":
+		return "sing-box"
+	case "xray":
+		return "xray"
+	case "v2ray", "v2fly":
+		return "v2ray"
+	case "mihomo", "clash", "clash-meta":
+		return "mihomo"
+	default:
+		return ""
+	}
+}
+
+func splitNonEmpty(s, sep string) []string {
+	var out []string
+	for _, p := range strings.Split(s, sep) {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func nodeRefLocal(id string) string          { return "local:" + id }
+func nodeRefSub(subID, nodeID string) string { return "sub:" + subID + ":" + nodeID }
+func chainRef(id string) string              { return "chain:" + id }
+
+func resolveNodeRef(st State, ref string) (ServerEntry, bool) {
+	if strings.HasPrefix(ref, "local:") {
+		id := strings.TrimPrefix(ref, "local:")
+		for _, n := range st.Servers {
+			if n.ID == id {
+				return n, true
+			}
+		}
+	}
+	if strings.HasPrefix(ref, "sub:") {
+		rest := strings.TrimPrefix(ref, "sub:")
+		parts := strings.SplitN(rest, ":", 2)
+		if len(parts) == 2 {
+			for _, sub := range st.Subscriptions {
+				if sub.ID != parts[0] {
+					continue
+				}
+				for _, n := range sub.Nodes {
+					if n.ID == parts[1] {
+						return n, true
+					}
+				}
+			}
+		}
+	}
+	return ServerEntry{}, false
+}
+
+func removeChain(chains []ChainEntry, id string) []ChainEntry {
+	out := chains[:0]
+	for _, c := range chains {
+		if c.ID != id {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func measureNodeLatency(ref string, n ServerEntry) LatencyResult {
+	host, port, err := nodeEndpoint(n)
+	if err != nil {
+		return LatencyResult{Ref: ref, Error: err.Error()}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	d := net.Dialer{Timeout: 2300 * time.Millisecond}
+	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	if err != nil {
+		return LatencyResult{Ref: ref, Error: "timeout"}
+	}
+	_ = conn.Close()
+	return LatencyResult{Ref: ref, LatencyMS: time.Since(start).Milliseconds()}
+}
+
+func nodeEndpoint(n ServerEntry) (string, int, error) {
+	if n.Proxy != nil {
+		h := strings.TrimSpace(stringValue(n.Proxy["server"]))
+		p := intValue(n.Proxy["port"])
+		if h != "" && p > 0 {
+			return h, p, nil
+		}
+	}
+	if n.RawKind == "sing-box" && n.Raw != nil {
+		h := strings.TrimSpace(stringValue(n.Raw["server"]))
+		p := intValue(n.Raw["server_port"])
+		if h != "" && p > 0 {
+			return h, p, nil
+		}
+	}
+	if n.RawKind == "xray" && n.Raw != nil {
+		if settings, ok := n.Raw["settings"].(map[string]interface{}); ok {
+			for _, key := range []string{"vnext", "servers"} {
+				if arr, ok := settings[key].([]interface{}); ok && len(arr) > 0 {
+					if m, ok := arr[0].(map[string]interface{}); ok {
+						h := firstNonEmpty(stringValue(m["address"]), stringValue(m["server"]))
+						p := intValue(m["port"])
+						if h != "" && p > 0 {
+							return h, p, nil
+						}
+					}
+				}
+			}
+		}
+	}
+	return "", 0, errors.New("server address is unavailable")
+}
+
+func allNodes(st State) []struct {
+	Ref   string
+	Node  ServerEntry
+	Group string
+} {
+	var out []struct {
+		Ref   string
+		Node  ServerEntry
+		Group string
+	}
+	for _, n := range st.Servers {
+		out = append(out, struct {
+			Ref   string
+			Node  ServerEntry
+			Group string
+		}{nodeRefLocal(n.ID), n, "Local"})
+	}
+	for _, sub := range st.Subscriptions {
+		for _, n := range sub.Nodes {
+			out = append(out, struct {
+				Ref   string
+				Node  ServerEntry
+				Group string
+			}{nodeRefSub(sub.ID, n.ID), n, sub.Name})
+		}
+	}
+	return out
+}
+
+func singBoxOutboundFromNode(n ServerEntry, tag string) (map[string]interface{}, error) {

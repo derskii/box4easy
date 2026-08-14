@@ -1,0 +1,396 @@
+
+func ensureV2RayCore() error {
+	target := filepath.Join(boxRoot(), "bin", "v2ray")
+	if st, err := os.Stat(target); err == nil && st.Mode()&0111 != 0 && st.Size() > 512*1024 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/v2fly/v2ray-core/releases/latest", nil)
+	req.Header.Set("User-Agent", "Box4Easy/0.2")
+	resp, err := (&http.Client{Transport: androidAwareTransport(), Timeout: 90 * time.Second}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("V2Ray release API returned %d", resp.StatusCode)
+	}
+	var rel githubRelease
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&rel); err != nil {
+		return err
+	}
+	asset := ""
+	best := -1
+	for _, a := range rel.Assets {
+		name := strings.ToLower(a.Name)
+		if !strings.HasSuffix(name, ".zip") || !strings.Contains(name, "v2ray-android-") {
+			continue
+		}
+		score := 0
+		switch runtime.GOARCH {
+		case "arm64":
+			if strings.Contains(name, "arm64") || strings.Contains(name, "v8a") {
+				score = 10
+			}
+		case "arm":
+			if strings.Contains(name, "arm32") || strings.Contains(name, "v7a") {
+				score = 10
+			}
+		case "amd64":
+			if strings.Contains(name, "amd64") || strings.Contains(name, "android-64") {
+				score = 10
+			}
+		case "386":
+			if strings.Contains(name, "386") || strings.Contains(name, "android-32") {
+				score = 10
+			}
+		}
+		if score > best {
+			best = score
+			asset = a.URL
+		}
+	}
+	if best < 1 || asset == "" {
+		return fmt.Errorf("V2Ray Android asset not found for %s", runtime.GOARCH)
+	}
+	req2, _ := http.NewRequestWithContext(ctx, http.MethodGet, asset, nil)
+	req2.Header.Set("User-Agent", "Box4Easy/0.2")
+	resp2, err := (&http.Client{Transport: androidAwareTransport(), Timeout: 90 * time.Second}).Do(req2)
+	if err != nil {
+		return err
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode < 200 || resp2.StatusCode >= 300 {
+		return fmt.Errorf("V2Ray download returned %d", resp2.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp2.Body, 100<<20))
+	if err != nil {
+		return err
+	}
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return err
+	}
+	var bin []byte
+	for _, f := range zr.File {
+		if strings.EqualFold(filepath.Base(f.Name), "v2ray") || strings.EqualFold(filepath.Base(f.Name), "v2ray.exe") {
+			r, e := f.Open()
+			if e != nil {
+				return e
+			}
+			bin, e = io.ReadAll(io.LimitReader(r, 80<<20))
+			r.Close()
+			if e != nil {
+				return e
+			}
+			break
+		}
+	}
+	if len(bin) < 512*1024 {
+		return errors.New("v2ray binary not found in release archive")
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+		return err
+	}
+	tmp := target + ".new"
+	if err := os.WriteFile(tmp, bin, 0700); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, target); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return os.Chmod(target, 0700)
+}
+
+func ensureMihomoCore() error {
+	target := filepath.Join(boxRoot(), "bin", "mihomo")
+	if st, err := os.Stat(target); err == nil && st.Mode()&0111 != 0 && st.Size() > 1024*1024 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", defaultUA)
+	resp, err := (&http.Client{Transport: androidAwareTransport(), Timeout: 45 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("cannot query Mihomo release: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("Mihomo release API returned %d", resp.StatusCode)
+	}
+	var rel githubRelease
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&rel); err != nil {
+		return err
+	}
+	archPattern := map[string]string{
+		"arm64": `(?i)^mihomo-android-arm64-v8-[^/]+\.gz$`,
+		"arm":   `(?i)^mihomo-android-armv7-[^/]+\.gz$`,
+		"amd64": `(?i)^mihomo-android-amd64-[^/]+\.gz$`,
+		"386":   `(?i)^mihomo-android-386-[^/]+\.gz$`,
+	}[runtime.GOARCH]
+	if archPattern == "" {
+		return fmt.Errorf("unsupported architecture for Mihomo: %s", runtime.GOARCH)
+	}
+	re := regexp.MustCompile(archPattern)
+	assetURL := ""
+	for _, a := range rel.Assets {
+		if re.MatchString(a.Name) {
+			assetURL = a.URL
+			break
+		}
+	}
+	if assetURL == "" {
+		return fmt.Errorf("Mihomo Android asset not found for %s", runtime.GOARCH)
+	}
+	req2, err := http.NewRequestWithContext(ctx, http.MethodGet, assetURL, nil)
+	if err != nil {
+		return err
+	}
+	req2.Header.Set("User-Agent", defaultUA)
+	resp2, err := (&http.Client{Transport: androidAwareTransport(), Timeout: 45 * time.Second}).Do(req2)
+	if err != nil {
+		return fmt.Errorf("cannot download Mihomo: %w", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode < 200 || resp2.StatusCode >= 300 {
+		return fmt.Errorf("Mihomo download returned %d", resp2.StatusCode)
+	}
+	zr, err := gzip.NewReader(io.LimitReader(resp2.Body, 80<<20))
+	if err != nil {
+		return fmt.Errorf("invalid Mihomo gzip: %w", err)
+	}
+	defer zr.Close()
+	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+		return err
+	}
+	tmp := target + ".new"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0700)
+	if err != nil {
+		return err
+	}
+	_, cpErr := io.Copy(f, io.LimitReader(zr, 120<<20))
+	closeErr := f.Close()
+	if cpErr != nil {
+		_ = os.Remove(tmp)
+		return cpErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmp)
+		return closeErr
+	}
+	if err := os.Chmod(tmp, 0700); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, target); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+func normalizeSubscriptionBody(body []byte) ([]byte, []string, int) {
+	cleaned := bytes.TrimSpace(body)
+	links := extractLinks(string(cleaned))
+	if len(links) > 0 {
+		return cleaned, links, len(links)
+	}
+	compact := strings.Map(func(r rune) rune {
+		if r == '\r' || r == '\n' || r == ' ' || r == '\t' {
+			return -1
+		}
+		return r
+	}, string(cleaned))
+	if compact != "" {
+		for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+			if decoded, err := enc.DecodeString(compact); err == nil {
+				dlinks := extractLinks(string(decoded))
+				if len(dlinks) > 0 {
+					return decoded, dlinks, len(dlinks)
+				}
+				if looksLikeClashYAML(decoded) {
+					return decoded, nil, 0
+				}
+			}
+		}
+	}
+	return cleaned, nil, 0
+}
+
+var linkRE = regexp.MustCompile(`(?m)(vless|vmess|trojan|hysteria2|hy2|ss|socks5?|socks)://[^\s]+`)
+var routingRE = regexp.MustCompile(`happ://routing/(?:add|onadd)/[A-Za-z0-9_\-+/=]+|happ://routing/off`)
+
+func extractLinks(s string) []string {
+	matches := linkRE.FindAllString(s, -1)
+	out := make([]string, 0, len(matches))
+	seen := map[string]bool{}
+	for _, m := range matches {
+		m = strings.TrimSpace(strings.TrimRight(m, "\r"))
+		if !seen[m] {
+			seen[m] = true
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func findRoutingInBody(body []byte) string {
+	return routingRE.FindString(string(body))
+}
+
+func parseRoutingLink(link string) *RoutingEntry {
+	link = strings.TrimSpace(link)
+	if link == "" {
+		return nil
+	}
+	if strings.EqualFold(link, "happ://routing/off") {
+		raw := json.RawMessage(`{"Name":"Routing off","GlobalProxy":true}`)
+		return &RoutingEntry{ID: "routing-off", Name: "Routing off", AutoEnable: true, Raw: raw}
+	}
+	auto := strings.HasPrefix(link, "happ://routing/onadd/")
+	prefix := "happ://routing/add/"
+	if auto {
+		prefix = "happ://routing/onadd/"
+	}
+	if !strings.HasPrefix(link, prefix) {
+		return nil
+	}
+	payload := strings.TrimPrefix(link, prefix)
+	var decoded []byte
+	var err error
+	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+		decoded, err = enc.DecodeString(payload)
+		if err == nil {
+			break
+		}
+	}
+	if err != nil || !json.Valid(decoded) {
+		return nil
+	}
+	var obj map[string]interface{}
+	if json.Unmarshal(decoded, &obj) != nil {
+		return nil
+	}
+	name := firstString(obj, "Name", "name")
+	if name == "" {
+		name = "Routing"
+	}
+	id := "route-" + shortHash(name+string(decoded))
+	return &RoutingEntry{ID: id, Name: name, AutoEnable: auto, Raw: append(json.RawMessage(nil), decoded...)}
+}
+
+func writeProviderFromLinks(path string, links []string) error {
+	var b strings.Builder
+	b.WriteString("proxies:\n")
+	used := map[string]int{}
+	valid := 0
+	for _, l := range links {
+		p, err := parseProxyURI(l)
+		if err != nil {
+			continue
+		}
+		name := stringValue(p["name"])
+		if name == "" {
+			name = "Node"
+		}
+		used[name]++
+		if used[name] > 1 {
+			name = fmt.Sprintf("%s #%d", name, used[name])
+			p["name"] = name
+		}
+		j, _ := json.Marshal(p)
+		b.WriteString("  - ")
+		b.Write(j)
+		b.WriteByte('\n')
+		valid++
+	}
+	if valid == 0 {
+		return errors.New("subscription did not contain a supported server URI")
+	}
+	return atomicWrite(path, []byte(b.String()), 0644)
+}
+
+func looksLikeClashYAML(body []byte) bool {
+	s := string(body)
+	return regexp.MustCompile(`(?m)^\s*proxies\s*:`).MatchString(s) || regexp.MustCompile(`(?m)^\s*proxy-providers\s*:`).MatchString(s)
+}
+
+func parseProxyURI(raw string) (map[string]interface{}, error) {
+	lower := strings.ToLower(raw)
+	switch {
+	case strings.HasPrefix(lower, "vless://"):
+		return parseVLESS(raw)
+	case strings.HasPrefix(lower, "trojan://"):
+		return parseTrojan(raw)
+	case strings.HasPrefix(lower, "hysteria2://"), strings.HasPrefix(lower, "hy2://"):
+		return parseHysteria2(raw)
+	case strings.HasPrefix(lower, "vmess://"):
+		return parseVMess(raw)
+	case strings.HasPrefix(lower, "ss://"):
+		return parseSS(raw)
+	case strings.HasPrefix(lower, "socks://"), strings.HasPrefix(lower, "socks5://"):
+		return parseSocks(raw)
+	default:
+		return nil, errors.New("unsupported server URI scheme")
+	}
+}
+
+func parseVLESS(raw string) (map[string]interface{}, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	host, port, err := hostPort(u)
+	if err != nil {
+		return nil, err
+	}
+	uuid := ""
+	if u.User != nil {
+		uuid = u.User.Username()
+	}
+	if uuid == "" {
+		return nil, errors.New("vless uuid is missing")
+	}
+	q := u.Query()
+	p := map[string]interface{}{"name": nodeName(u, host), "type": "vless", "server": host, "port": port, "uuid": uuid, "udp": true}
+	if flow := q.Get("flow"); flow != "" {
+		p["flow"] = flow
+	}
+	security := strings.ToLower(q.Get("security"))
+	if security == "tls" || security == "reality" {
+		p["tls"] = true
+		if sni := firstNonEmpty(q.Get("sni"), q.Get("servername")); sni != "" {
+			p["servername"] = sni
+		}
+		if fp := q.Get("fp"); fp != "" {
+			p["client-fingerprint"] = fp
+		}
+		if q.Get("allowInsecure") == "1" || strings.EqualFold(q.Get("insecure"), "true") {
+			p["skip-cert-verify"] = true
+		}
+	}
+	if security == "reality" {
+		ro := map[string]interface{}{}
+		if pbk := firstNonEmpty(q.Get("pbk"), q.Get("publicKey")); pbk != "" {
+			ro["public-key"] = pbk
+		}
+		if sid := firstNonEmpty(q.Get("sid"), q.Get("shortId")); sid != "" {
+			ro["short-id"] = sid
+		}
+		if len(ro) > 0 {
+			p["reality-opts"] = ro
+		}
+	}
+	applyTransport(p, q)
+	return p, nil
+}
+
+func parseTrojan(raw string) (map[string]interface{}, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, err

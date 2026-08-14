@@ -20,6 +20,26 @@ log_line() {
     printf '%s [Info]: %s\n' "$(date +"%Y-%m-%d %H:%M:%S")" "$1" >> "${run_path}/run.log"
 }
 
+fail_safe_guard() {
+    sleep 2
+    if ! busybox pidof "${bin_name}" >/dev/null 2>&1; then
+        log_line "core ${bin_name} died after start; disabling transparent proxy"
+        "${tproxy_path}" stop >> /dev/null 2>> "${run_path}/run.log"
+        "${service_path}" stop >> /dev/null 2>> "${run_path}/run.log"
+        return 1
+    fi
+    return 0
+}
+
+start_with_guard() {
+    "${service_path}" "$1" >> /dev/null 2>> "${run_path}/run.log" || return 1
+    "${tproxy_path}" start >> /dev/null 2>> "${run_path}/run.log" || {
+        "${service_path}" stop >> /dev/null 2>> "${run_path}/run.log"
+        return 1
+    }
+    fail_safe_guard
+}
+
 process_request() {
     local request_path="$1"
     [ -f "${request_path}" ] || return 0
@@ -30,8 +50,7 @@ process_request() {
     case "${action}" in
         start)
             log_line "webui queued service action: start"
-            "${service_path}" start >> /dev/null 2>> "${run_path}/run.log" \
-                && "${tproxy_path}" start >> /dev/null 2>> "${run_path}/run.log"
+            start_with_guard start
             ;;
         stop)
             log_line "webui queued service action: stop"
@@ -41,8 +60,7 @@ process_request() {
         restart)
             log_line "webui queued service action: restart"
             "${tproxy_path}" stop >> /dev/null 2>> "${run_path}/run.log"
-            "${service_path}" restart >> /dev/null 2>> "${run_path}/run.log" \
-                && "${tproxy_path}" start >> /dev/null 2>> "${run_path}/run.log"
+            start_with_guard restart
             ;;
         *)
             log_line "webui queued service action ignored: ${action:-unknown}"
