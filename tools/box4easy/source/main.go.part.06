@@ -164,10 +164,15 @@ func validateJSONCoreConfig(core, path string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 	var cmd *exec.Cmd
-	if core == "sing-box" {
+	switch core {
+	case "sing-box":
 		cmd = exec.CommandContext(ctx, bin, "check", "-c", path)
-	} else {
-		cmd = exec.CommandContext(ctx, bin, "run", "-test", "-config", path)
+	case "xray":
+		cmd = exec.CommandContext(ctx, bin, "-test", "-confdir", filepath.Dir(path))
+	case "v2ray":
+		cmd = exec.CommandContext(ctx, bin, "test", "-d", filepath.Dir(path))
+	default:
+		return fmt.Errorf("unsupported JSON core: %s", core)
 	}
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
@@ -197,7 +202,12 @@ func rebuildMihomoConfig(dir string, st State) error {
 	b.WriteString("dns:\n  enable: true\n  listen: 0.0.0.0:1053\n  ipv6: false\n  enhanced-mode: fake-ip\n  fake-ip-range: 198.18.0.0/15\n  fake-ip-filter:\n    - '*'\n    - '+.lan'\n    - '+.local'\n  default-nameserver:\n    - 1.1.1.1\n    - 8.8.8.8\n  nameserver:\n    - https://cloudflare-dns.com/dns-query\n    - https://dns.google/dns-query\n")
 
 	b.WriteString("proxy-providers:\n")
+	compatibleMihomoSubs := 0
 	for _, sub := range st.Subscriptions {
+		if strings.Contains(strings.ToLower(sub.SourceFormat), "json") {
+			continue
+		}
+		compatibleMihomoSubs++
 		key := providerKey(sub.ID)
 		fmt.Fprintf(&b, "  %s:\n", yamlQuote(key))
 		if sub.ProviderKind == "file" {
@@ -211,7 +221,7 @@ func rebuildMihomoConfig(dir string, st State) error {
 		fmt.Fprintf(&b, "    override:\n      additional-prefix: %s\n", yamlQuote("["+sub.Name+"] "))
 		b.WriteString("    health-check:\n      enable: true\n      url: https://www.gstatic.com/generate_204\n      interval: 300\n      timeout: 5000\n      lazy: true\n")
 	}
-	if len(st.Subscriptions) == 0 {
+	if compatibleMihomoSubs == 0 {
 		b.WriteString("  {}\n")
 	}
 
@@ -228,6 +238,9 @@ func rebuildMihomoConfig(dir string, st State) error {
 
 	subGroupNames := make([]string, 0, len(st.Subscriptions))
 	for _, sub := range st.Subscriptions {
+		if strings.Contains(strings.ToLower(sub.SourceFormat), "json") {
+			continue
+		}
 		subGroupNames = append(subGroupNames, groupName(sub))
 	}
 	localNames := make([]string, 0, len(st.Servers))
@@ -247,6 +260,9 @@ func rebuildMihomoConfig(dir string, st State) error {
 
 	b.WriteString("  - name: AUTO\n    type: url-test\n    url: https://www.gstatic.com/generate_204\n    interval: 300\n    tolerance: 50\n    include-all: true\n")
 	for _, sub := range st.Subscriptions {
+		if strings.Contains(strings.ToLower(sub.SourceFormat), "json") {
+			continue
+		}
 		fmt.Fprintf(&b, "  - name: %s\n    type: select\n    use:\n      - %s\n", yamlQuote(groupName(sub)), yamlQuote(providerKey(sub.ID)))
 	}
 	b.WriteString("  - name: GLOBAL\n    type: select\n    proxies:\n      - PROXY\n      - AUTO\n")
