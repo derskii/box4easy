@@ -27,17 +27,17 @@ import (
 )
 
 const (
-	stateVersion = 2
+	stateVersion = 3
 	maxBodyBytes = 8 << 20
-	defaultUA    = "Box4Easy/0.2"
+	defaultUA    = "Box4Easy/1.0"
 )
 
 type State struct {
 	Version       int            `json:"version"`
 	EasyEnabled   bool           `json:"easyEnabled"`
 	PreviousCore  string         `json:"previousCore,omitempty"`
-	Core          string         `json:"core"` // sing-box, xray, v2ray, mihomo
-	Mode          string         `json:"mode"` // routing, global, direct
+	Core          string         `json:"core"`
+	Mode          string         `json:"mode"`
 	ActiveRouting string         `json:"activeRouting,omitempty"`
 	SelectedNode  string         `json:"selectedNode,omitempty"`
 	Subscriptions []Subscription `json:"subscriptions"`
@@ -51,9 +51,9 @@ type Subscription struct {
 	ID            string        `json:"id"`
 	Name          string        `json:"name"`
 	URL           string        `json:"url"`
-	ProviderKind  string        `json:"providerKind"` // http, file, json
+	ProviderKind  string        `json:"providerKind"`
 	ProviderPath  string        `json:"providerPath,omitempty"`
-	SourceFormat  string        `json:"sourceFormat,omitempty"` // uri-list, sing-box-json, xray-json, mihomo-yaml
+	SourceFormat  string        `json:"sourceFormat,omitempty"`
 	UserAgent     string        `json:"userAgent,omitempty"`
 	RoutingID     string        `json:"routingId,omitempty"`
 	LastUpdate    string        `json:"lastUpdate,omitempty"`
@@ -67,8 +67,8 @@ type ServerEntry struct {
 	Name      string                 `json:"name"`
 	URI       string                 `json:"uri,omitempty"`
 	SourceSub string                 `json:"sourceSubscription,omitempty"`
-	Proxy     map[string]interface{} `json:"proxy,omitempty"`   // canonical URI-derived proxy fields
-	RawKind   string                 `json:"rawKind,omitempty"` // sing-box or xray
+	Proxy     map[string]interface{} `json:"proxy,omitempty"`
+	RawKind   string                 `json:"rawKind,omitempty"`
 	Raw       map[string]interface{} `json:"raw,omitempty"`
 }
 
@@ -83,7 +83,7 @@ type RoutingEntry struct {
 type ChainEntry struct {
 	ID      string   `json:"id"`
 	Name    string   `json:"name"`
-	Hops    []string `json:"hops"` // node refs: local:<id> or sub:<sub-id>:<node-id>
+	Hops    []string `json:"hops"`
 	Enabled bool     `json:"enabled"`
 }
 
@@ -137,6 +137,9 @@ func main() {
 		}
 		printJSON(st)
 	case "enable":
+		if len(st.Subscriptions) == 0 && len(st.Servers) == 0 {
+			fatal(errors.New("import at least one subscription or server before activation"))
+		}
 		if !st.EasyEnabled {
 			if err := backupAdvancedConfig(*dir); err != nil {
 				fatal(err)
@@ -169,12 +172,8 @@ func main() {
 		if strings.TrimSpace(*rawURL) == "" {
 			fatal(errors.New("--url is required"))
 		}
-		if !st.EasyEnabled {
-			if err := backupAdvancedConfig(*dir); err != nil {
-				fatal(err)
-			}
-			st.EasyEnabled = true
-		}
+		// Import is deliberately non-destructive. While Easy Mode is disabled this
+		// only stores parsed nodes. Network/core changes happen later via enable.
 		sub, routing, err := importSubscription(*dir, *name, *rawURL, "")
 		if err != nil {
 			fatal(err)
@@ -259,6 +258,7 @@ func main() {
 			st.ActiveRouting = ""
 		}
 		_ = os.Remove(filepath.Join(*dir, "providers", safeID(*id)+".yaml"))
+		_ = os.Remove(filepath.Join(*dir, "providers", safeID(*id)+".json"))
 		if err := saveAndRebuild(*dir, st); err != nil {
 			fatal(err)
 		}
@@ -266,12 +266,6 @@ func main() {
 	case "add-server":
 		if strings.TrimSpace(*uri) == "" {
 			fatal(errors.New("--uri is required"))
-		}
-		if !st.EasyEnabled {
-			if err := backupAdvancedConfig(*dir); err != nil {
-				fatal(err)
-			}
-			st.EasyEnabled = true
 		}
 		proxy, err := parseProxyURI(strings.TrimSpace(*uri))
 		if err != nil {
