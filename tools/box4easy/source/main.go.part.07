@@ -1,0 +1,314 @@
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		ls := strings.ToLower(s)
+		switch {
+		case strings.HasPrefix(ls, "geoip:"):
+			fmt.Fprintf(b, "  - GEOIP,%s,%s\n", strings.TrimSpace(s[len("geoip:"):]), outbound)
+		case strings.Contains(s, "/"):
+			if strings.Contains(s, ":") {
+				fmt.Fprintf(b, "  - IP-CIDR6,%s,%s,no-resolve\n", s, outbound)
+			} else {
+				fmt.Fprintf(b, "  - IP-CIDR,%s,%s,no-resolve\n", s, outbound)
+			}
+		default:
+			if net.ParseIP(s) != nil {
+				if strings.Contains(s, ":") {
+					fmt.Fprintf(b, "  - IP-CIDR6,%s/128,%s,no-resolve\n", s, outbound)
+				} else {
+					fmt.Fprintf(b, "  - IP-CIDR,%s/32,%s,no-resolve\n", s, outbound)
+				}
+			}
+		}
+	}
+}
+
+func validateMihomoConfig(path string) error {
+	bin := filepath.Join(boxRoot(), "bin", "mihomo")
+	if _, err := os.Stat(bin); err != nil {
+		return nil
+	} // Core may not be downloaded yet.
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "-t", "-f", path)
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return errors.New("validation timed out")
+	}
+	if err != nil {
+		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func readClashAPIConfig() (string, string) {
+	port, secret := "9090", ""
+	b, err := os.ReadFile(filepath.Join(boxRoot(), "scripts", "box.config"))
+	if err != nil {
+		return port, secret
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "clash_api_port=") {
+			port = trimShellValue(strings.TrimPrefix(line, "clash_api_port="))
+		}
+		if strings.HasPrefix(line, "clash_api_secret=") {
+			secret = trimShellValue(strings.TrimPrefix(line, "clash_api_secret="))
+		}
+	}
+	if port == "" {
+		port = "9090"
+	}
+	return port, secret
+}
+
+func trimShellValue(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && ((s[0] == '\'' && s[len(s)-1] == '\'') || (s[0] == '"' && s[len(s)-1] == '"')) {
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+func atomicWrite(path string, b []byte, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, mode); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func printJSON(v interface{}) {
+	b, _ := json.Marshal(v)
+	fmt.Println(string(b))
+}
+
+func fatal(err error) {
+	b, _ := json.Marshal(map[string]interface{}{"ok": false, "error": err.Error()})
+	fmt.Fprintln(os.Stderr, string(b))
+	os.Exit(1)
+}
+
+func newID(prefix string) string {
+	return fmt.Sprintf("%s-%d-%s", prefix, time.Now().Unix(), shortHash(fmt.Sprintf("%d", time.Now().UnixNano())))
+}
+func shortHash(s string) string {
+	// FNV-1a, stable and sufficient for local IDs (not security-sensitive).
+	var h uint32 = 2166136261
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= 16777619
+	}
+	return fmt.Sprintf("%08x", h)
+}
+func safeID(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "item"
+	}
+	return b.String()
+}
+func providerKey(id string) string    { return "sub_" + safeID(id) }
+func groupName(s Subscription) string { return "SUB · " + s.Name }
+func yamlQuote(s string) string       { b, _ := json.Marshal(s); return string(b) }
+func nodeName(u *url.URL, fallback string) string {
+	if u.Fragment != "" {
+		if n, err := url.QueryUnescape(u.Fragment); err == nil && n != "" {
+			return n
+		}
+		return u.Fragment
+	}
+	return fallback
+}
+func hostPort(u *url.URL) (string, int, error) {
+	host := u.Hostname()
+	if host == "" {
+		return "", 0, errors.New("server host is missing")
+	}
+	ps := u.Port()
+	if ps == "" {
+		return "", 0, errors.New("server port is missing")
+	}
+	p, err := strconv.Atoi(ps)
+	if err != nil || p <= 0 || p > 65535 {
+		return "", 0, errors.New("invalid server port")
+	}
+	return host, p, nil
+}
+func firstNonEmpty(v ...string) string {
+	for _, s := range v {
+		if s != "" {
+			return s
+		}
+	}
+	return ""
+}
+func stringValue(v interface{}) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return fmt.Sprint(v)
+}
+func intValue(v interface{}) int {
+	switch x := v.(type) {
+	case float64:
+		return int(x)
+	case int:
+		return x
+	case string:
+		n, _ := strconv.Atoi(x)
+		return n
+	case json.Number:
+		n, _ := strconv.Atoi(x.String())
+		return n
+	}
+	return 0
+}
+func toIntOrString(s string) interface{} {
+	if n, err := strconv.Atoi(s); err == nil {
+		return n
+	}
+	return s
+}
+func decodeB64String(s string) string {
+	s = strings.TrimSpace(s)
+	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+		if b, err := enc.DecodeString(s); err == nil {
+			return string(b)
+		}
+	}
+	return ""
+}
+func cloneMap(in map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+func findSubscription(s []Subscription, id string) int {
+	for i := range s {
+		if s[i].ID == id {
+			return i
+		}
+	}
+	return -1
+}
+func removeSubscription(s []Subscription, id string) []Subscription {
+	out := s[:0]
+	for _, x := range s {
+		if x.ID != id {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+func removeServer(s []ServerEntry, id string) []ServerEntry {
+	out := s[:0]
+	for _, x := range s {
+		if x.ID != id {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+func findRouting(s []RoutingEntry, id string) int {
+	for i := range s {
+		if s[i].ID == id {
+			return i
+		}
+	}
+	return -1
+}
+func upsertRouting(s []RoutingEntry, r RoutingEntry) []RoutingEntry {
+	if i := findRouting(s, r.ID); i >= 0 {
+		s[i] = r
+		return s
+	}
+	return append(s, r)
+}
+func removeRoutingsBySub(s []RoutingEntry, sub string) []RoutingEntry {
+	out := s[:0]
+	for _, x := range s {
+		if x.SourceSub != sub {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+func firstString(m map[string]interface{}, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := m[k]; ok {
+			switch x := v.(type) {
+			case string:
+				return x
+			case json.Number:
+				return x.String()
+			case float64:
+				return strconv.FormatFloat(x, 'f', -1, 64)
+			}
+		}
+	}
+	return ""
+}
+func firstInterface(m map[string]interface{}, keys ...string) interface{} {
+	for _, k := range keys {
+		if v, ok := m[k]; ok {
+			return v
+		}
+	}
+	return nil
+}
+func stringSlice(v interface{}) []string {
+	switch x := v.(type) {
+	case []interface{}:
+		out := make([]string, 0, len(x))
+		for _, v := range x {
+			if s, ok := v.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	case []string:
+		return x
+	case string:
+		if x == "" {
+			return nil
+		}
+		return []string{x}
+	}
+	return nil
+}
+func boolish(v interface{}, def bool) bool {
+	switch x := v.(type) {
+	case bool:
+		return x
+	case string:
+		if b, e := strconv.ParseBool(x); e == nil {
+			return b
+		}
+		return x == "1"
+	case float64:
+		return x != 0
+	}
+	return def
+}
+func lowerFirst(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToLower(s[:1]) + s[1:]
+}
+
+// Keep deterministic ordering helpers available for future state migrations / UI exports.
+var _ = bufio.NewScanner
+var _ = sort.Strings
