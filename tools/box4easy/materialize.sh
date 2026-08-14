@@ -16,12 +16,13 @@ sed -i 's/sing-box Box4Easy\/0.2/Happ\/1.0 (sing-box; Box4Easy)/g' main.go
 sed -i 's/v2rayNG\/1.10 Box4Easy\/0.2/v2rayNG\/Box4Easy-1.0/g' main.go
 sed -i 's/Clash.Meta\/1.19.8 Mihomo/Clash.Meta\/Box4Easy-1.0/g' main.go
 
-# Legacy stringValue used fmt.Sprint(nil), which returns "<nil>". That made
-# absent JSON fields look non-empty and could misclassify Xray JSON as sing-box.
 python3 - <<'PY'
 from pathlib import Path
 p = Path('main.go')
 s = p.read_text()
+
+# Legacy stringValue used fmt.Sprint(nil), which returns "<nil>". That made
+# absent JSON fields look non-empty and could misclassify Xray JSON as sing-box.
 old = '''func stringValue(v interface{}) string {
 	if s, ok := v.(string); ok {
 		return s
@@ -56,7 +57,19 @@ new = '''func stringValue(v interface{}) string {
 }'''
 if old not in s:
     raise SystemExit('legacy stringValue function not found')
-p.write_text(s.replace(old, new, 1))
+s = s.replace(old, new, 1)
+
+# Enable boot autostart only after the first validated Easy configuration.
+start = s.index('case "enable":')
+end = s.index('case "disable":', start)
+segment = s[start:end]
+needle = '\t\tprintJSON(st)\n'
+if needle not in segment:
+    raise SystemExit('enable printJSON anchor not found')
+segment = segment.replace(needle, '\t\tif err := markV1Activated(*dir); err != nil {\n\t\t\tfatal(err)\n\t\t}\n\t\tprintJSON(st)\n', 1)
+s = s[:start] + segment + s[end:]
+
+p.write_text(s)
 PY
 
 gofmt -w main.go
