@@ -52,3 +52,29 @@ func TestDisabledEasyStateDoesNotRebuildCoreConfig(t *testing.T) {
 		t.Fatalf("staged state was not saved: %v", err)
 	}
 }
+
+func TestMarkV1ActivatedRemovesManualGate(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Setenv("BOX4EASY_BOX_ROOT", root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Unsetenv("BOX4EASY_BOX_ROOT") })
+
+	dir := filepath.Join(root, "easy")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	manual := filepath.Join(root, "manual")
+	if err := os.WriteFile(manual, []byte("manual\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := markV1Activated(dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(manual); !os.IsNotExist(err) {
+		t.Fatalf("manual gate still exists: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "v1.activated")); err != nil || string(b) != "ok\n" {
+		t.Fatalf("activation marker missing or invalid: %q, %v", b, err)
+	}
+}
