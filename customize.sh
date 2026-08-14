@@ -20,7 +20,32 @@ fi
 [ -d "$service_dir" ] || mkdir -p "$service_dir"
 unzip -qo "${ZIPFILE}" -x 'META-INF/*' -d "$MODPATH"
 
+# Upgrading from the broken alpha must never inherit a live transparent-proxy
+# rule set or stale Easy state. Stop the old network path first, keep a backup,
+# and force manual mode for the first RC boot. The user can enable autostart later.
 if [ -d /data/adb/box ]; then
+  if [ -x /data/adb/box/scripts/box.tproxy ]; then
+    /data/adb/box/scripts/box.tproxy stop >/dev/null 2>&1 || true
+  fi
+  if [ -x /data/adb/box/scripts/box.service ]; then
+    /data/adb/box/scripts/box.service stop >/dev/null 2>&1 || true
+  fi
+
+  if [ -f /data/adb/box/easy/state.json ]; then
+    old_easy_version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' /data/adb/box/easy/state.json | head -n1)"
+    if [ -z "$old_easy_version" ] || [ "$old_easy_version" -lt 3 ]; then
+      backup_dir="/data/adb/box/easy-alpha-backup-$(date +%Y%m%d-%H%M%S)"
+      mkdir -p "$backup_dir"
+      cp -af /data/adb/box/easy/state.json "$backup_dir/" 2>/dev/null || true
+      [ -d /data/adb/box/easy/providers ] && cp -af /data/adb/box/easy/providers "$backup_dir/" 2>/dev/null || true
+      rm -f /data/adb/box/easy/state.json
+      rm -rf /data/adb/box/easy/providers
+      mkdir -p /data/adb/box/easy/providers
+      touch /data/adb/box/manual
+      ui_print "- Old Box4Easy alpha state backed up and disabled for safe migration"
+    fi
+  fi
+
   cp /data/adb/box/scripts/box.config /data/adb/box/scripts/box.config.bak
   ui_print "- Existing box.config backed up"
 
@@ -46,7 +71,7 @@ esac
 
 helper_src="$MODPATH/easy-bin/box4easy-$easy_arch"
 [ -f "$helper_src" ] || abort "Error: Box4Easy helper for $easy_arch is missing from ZIP"
-mkdir -p /data/adb/box/bin /data/adb/box/easy /data/adb/box/run
+mkdir -p /data/adb/box/bin /data/adb/box/easy /data/adb/box/easy/providers /data/adb/box/run
 cp -f "$helper_src" /data/adb/box/bin/box4easy
 chmod 0700 /data/adb/box/bin/box4easy
 rm -rf "$MODPATH/easy-bin" "$MODPATH/tools"
