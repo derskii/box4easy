@@ -1,0 +1,350 @@
+	// Common subscription format: whole body is base64-encoded newline-separated links.
+	compact := strings.Map(func(r rune) rune {
+		if r == '\r' || r == '\n' || r == ' ' || r == '\t' {
+			return -1
+		}
+		return r
+	}, string(cleaned))
+	if compact != "" {
+		for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+			if decoded, err := enc.DecodeString(compact); err == nil {
+				dlinks := extractLinks(string(decoded))
+				if len(dlinks) > 0 {
+					return decoded, dlinks, len(dlinks)
+				}
+				if looksLikeClashYAML(decoded) {
+					return decoded, nil, 0
+				}
+			}
+		}
+	}
+	return cleaned, nil, 0
+}
+
+var linkRE = regexp.MustCompile(`(?m)(vless|vmess|trojan|hysteria2|hy2|ss|socks5?|socks)://[^\s]+`)
+var routingRE = regexp.MustCompile(`happ://routing/(?:add|onadd)/[A-Za-z0-9_\-+/=]+|happ://routing/off`)
+
+func extractLinks(s string) []string {
+	matches := linkRE.FindAllString(s, -1)
+	out := make([]string, 0, len(matches))
+	seen := map[string]bool{}
+	for _, m := range matches {
+		m = strings.TrimSpace(strings.TrimRight(m, "\r"))
+		if !seen[m] {
+			seen[m] = true
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func findRoutingInBody(body []byte) string {
+	return routingRE.FindString(string(body))
+}
+
+func parseRoutingLink(link string) *RoutingEntry {
+	link = strings.TrimSpace(link)
+	if link == "" {
+		return nil
+	}
+	if strings.EqualFold(link, "happ://routing/off") {
+		raw := json.RawMessage(`{"Name":"Routing off","GlobalProxy":true}`)
+		return &RoutingEntry{ID: "routing-off", Name: "Routing off", AutoEnable: true, Raw: raw}
+	}
+	auto := strings.HasPrefix(link, "happ://routing/onadd/")
+	prefix := "happ://routing/add/"
+	if auto {
+		prefix = "happ://routing/onadd/"
+	}
+	if !strings.HasPrefix(link, prefix) {
+		return nil
+	}
+	payload := strings.TrimPrefix(link, prefix)
+	var decoded []byte
+	var err error
+	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+		decoded, err = enc.DecodeString(payload)
+		if err == nil {
+			break
+		}
+	}
+	if err != nil || !json.Valid(decoded) {
+		return nil
+	}
+	var obj map[string]interface{}
+	if json.Unmarshal(decoded, &obj) != nil {
+		return nil
+	}
+	name := firstString(obj, "Name", "name")
+	if name == "" {
+		name = "Routing"
+	}
+	id := "route-" + shortHash(name+string(decoded))
+	return &RoutingEntry{ID: id, Name: name, AutoEnable: auto, Raw: append(json.RawMessage(nil), decoded...)}
+}
+
+func writeProviderFromLinks(path string, links []string) error {
+	var b strings.Builder
+	b.WriteString("proxies:\n")
+	used := map[string]int{}
+	valid := 0
+	for _, l := range links {
+		p, err := parseProxyURI(l)
+		if err != nil {
+			continue
+		}
+		name := stringValue(p["name"])
+		if name == "" {
+			name = "Node"
+		}
+		used[name]++
+		if used[name] > 1 {
+			name = fmt.Sprintf("%s #%d", name, used[name])
+			p["name"] = name
+		}
+		j, _ := json.Marshal(p)
+		b.WriteString("  - ")
+		b.Write(j)
+		b.WriteByte('\n')
+		valid++
+	}
+	if valid == 0 {
+		return errors.New("subscription did not contain a supported server URI")
+	}
+	return atomicWrite(path, []byte(b.String()), 0644)
+}
+
+func looksLikeClashYAML(body []byte) bool {
+	s := string(body)
+	return regexp.MustCompile(`(?m)^\s*proxies\s*:`).MatchString(s) || regexp.MustCompile(`(?m)^\s*proxy-providers\s*:`).MatchString(s)
+}
+
+func parseProxyURI(raw string) (map[string]interface{}, error) {
+	lower := strings.ToLower(raw)
+	switch {
+	case strings.HasPrefix(lower, "vless://"):
+		return parseVLESS(raw)
+	case strings.HasPrefix(lower, "trojan://"):
+		return parseTrojan(raw)
+	case strings.HasPrefix(lower, "hysteria2://"), strings.HasPrefix(lower, "hy2://"):
+		return parseHysteria2(raw)
+	case strings.HasPrefix(lower, "vmess://"):
+		return parseVMess(raw)
+	case strings.HasPrefix(lower, "ss://"):
+		return parseSS(raw)
+	case strings.HasPrefix(lower, "socks://"), strings.HasPrefix(lower, "socks5://"):
+		return parseSocks(raw)
+	default:
+		return nil, errors.New("unsupported server URI scheme")
+	}
+}
+
+func parseVLESS(raw string) (map[string]interface{}, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	host, port, err := hostPort(u)
+	if err != nil {
+		return nil, err
+	}
+	uuid := ""
+	if u.User != nil {
+		uuid = u.User.Username()
+	}
+	if uuid == "" {
+		return nil, errors.New("vless uuid is missing")
+	}
+	q := u.Query()
+	p := map[string]interface{}{"name": nodeName(u, host), "type": "vless", "server": host, "port": port, "uuid": uuid, "udp": true}
+	if flow := q.Get("flow"); flow != "" {
+		p["flow"] = flow
+	}
+	security := strings.ToLower(q.Get("security"))
+	if security == "tls" || security == "reality" {
+		p["tls"] = true
+		if sni := firstNonEmpty(q.Get("sni"), q.Get("servername")); sni != "" {
+			p["servername"] = sni
+		}
+		if fp := q.Get("fp"); fp != "" {
+			p["client-fingerprint"] = fp
+		}
+		if q.Get("allowInsecure") == "1" || strings.EqualFold(q.Get("insecure"), "true") {
+			p["skip-cert-verify"] = true
+		}
+	}
+	if security == "reality" {
+		ro := map[string]interface{}{}
+		if pbk := firstNonEmpty(q.Get("pbk"), q.Get("publicKey")); pbk != "" {
+			ro["public-key"] = pbk
+		}
+		if sid := firstNonEmpty(q.Get("sid"), q.Get("shortId")); sid != "" {
+			ro["short-id"] = sid
+		}
+		if len(ro) > 0 {
+			p["reality-opts"] = ro
+		}
+	}
+	applyTransport(p, q)
+	return p, nil
+}
+
+func parseTrojan(raw string) (map[string]interface{}, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	host, port, err := hostPort(u)
+	if err != nil {
+		return nil, err
+	}
+	password := ""
+	if u.User != nil {
+		password = u.User.Username()
+	}
+	if password == "" {
+		return nil, errors.New("trojan password is missing")
+	}
+	q := u.Query()
+	p := map[string]interface{}{"name": nodeName(u, host), "type": "trojan", "server": host, "port": port, "password": password, "udp": true}
+	if sni := firstNonEmpty(q.Get("sni"), q.Get("peer"), q.Get("servername")); sni != "" {
+		p["sni"] = sni
+	}
+	if fp := q.Get("fp"); fp != "" {
+		p["client-fingerprint"] = fp
+	}
+	if q.Get("allowInsecure") == "1" || strings.EqualFold(q.Get("insecure"), "true") {
+		p["skip-cert-verify"] = true
+	}
+	applyTransport(p, q)
+	return p, nil
+}
+
+func parseHysteria2(raw string) (map[string]interface{}, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	host, port, err := hostPort(u)
+	if err != nil {
+		return nil, err
+	}
+	password := ""
+	if u.User != nil {
+		password = u.User.Username()
+		if pw, ok := u.User.Password(); ok && pw != "" {
+			password = pw
+		}
+	}
+	if password == "" {
+		return nil, errors.New("hysteria2 password is missing")
+	}
+	q := u.Query()
+	p := map[string]interface{}{"name": nodeName(u, host), "type": "hysteria2", "server": host, "port": port, "password": password}
+	if sni := q.Get("sni"); sni != "" {
+		p["sni"] = sni
+	}
+	if q.Get("insecure") == "1" || strings.EqualFold(q.Get("insecure"), "true") {
+		p["skip-cert-verify"] = true
+	}
+	if obfs := q.Get("obfs"); obfs != "" {
+		p["obfs"] = obfs
+	}
+	if op := firstNonEmpty(q.Get("obfs-password"), q.Get("obfsPassword")); op != "" {
+		p["obfs-password"] = op
+	}
+	if up := q.Get("up"); up != "" {
+		p["up"] = up
+	}
+	if down := q.Get("down"); down != "" {
+		p["down"] = down
+	}
+	return p, nil
+}
+
+func parseVMess(raw string) (map[string]interface{}, error) {
+	payload := strings.TrimPrefix(raw, "vmess://")
+	payload = strings.TrimSpace(payload)
+	var decoded []byte
+	var err error
+	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+		decoded, err = enc.DecodeString(payload)
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		return nil, errors.New("invalid vmess base64")
+	}
+	var v map[string]interface{}
+	if err := json.Unmarshal(decoded, &v); err != nil {
+		return nil, errors.New("invalid vmess json")
+	}
+	host := firstString(v, "add", "host")
+	id := firstString(v, "id")
+	if host == "" || id == "" {
+		return nil, errors.New("vmess host/id missing")
+	}
+	port, _ := strconv.Atoi(firstString(v, "port"))
+	if port == 0 {
+		port = intValue(v["port"])
+	}
+	if port == 0 {
+		return nil, errors.New("vmess port missing")
+	}
+	name := firstString(v, "ps", "name")
+	if name == "" {
+		name = host
+	}
+	p := map[string]interface{}{"name": name, "type": "vmess", "server": host, "port": port, "uuid": id, "alterId": intValue(v["aid"]), "cipher": "auto", "udp": true}
+	if tls := strings.ToLower(firstString(v, "tls")); tls == "tls" {
+		p["tls"] = true
+	}
+	if sni := firstString(v, "sni", "serverName"); sni != "" {
+		p["servername"] = sni
+	}
+	if fp := firstString(v, "fp"); fp != "" {
+		p["client-fingerprint"] = fp
+	}
+	netType := firstString(v, "net")
+	if netType != "" && netType != "tcp" {
+		p["network"] = netType
+		switch netType {
+		case "ws":
+			opts := map[string]interface{}{}
+			if path := firstString(v, "path"); path != "" {
+				opts["path"] = path
+			}
+			if h := firstString(v, "host"); h != "" {
+				opts["headers"] = map[string]interface{}{"Host": h}
+			}
+			p["ws-opts"] = opts
+		case "grpc":
+			p["grpc-opts"] = map[string]interface{}{"grpc-service-name": firstString(v, "path")}
+		}
+	}
+	return p, nil
+}
+
+func parseSS(raw string) (map[string]interface{}, error) {
+	rest := strings.TrimPrefix(raw, "ss://")
+	frag := ""
+	if i := strings.Index(rest, "#"); i >= 0 {
+		frag, _ = url.QueryUnescape(rest[i+1:])
+		rest = rest[:i]
+	}
+	// SIP002: base64(method:password)@host:port OR base64(method:password@host:port)
+	var userinfo, hostport string
+	if at := strings.LastIndex(rest, "@"); at >= 0 {
+		userinfo, hostport = rest[:at], rest[at+1:]
+		if dec := decodeB64String(userinfo); dec != "" {
+			userinfo = dec
+		}
+	} else {
+		dec := decodeB64String(rest)
+		if dec == "" {
+			return nil, errors.New("invalid ss base64")
+		}
+		at := strings.LastIndex(dec, "@")
+		if at < 0 {
+			return nil, errors.New("invalid ss payload")
