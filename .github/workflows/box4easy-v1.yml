@@ -1,0 +1,74 @@
+name: Box4Easy 1.0 Build
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - BOX4EASY_V1_TRIGGER
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Box4Easy 1.0 branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/box4easy-1.0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache-dependency-path: tools/box4easy/go.mod
+
+      - name: Materialize and validate helper
+        working-directory: tools/box4easy
+        run: |
+          sh materialize.sh
+          go test ./...
+          go vet ./...
+
+      - name: Build helper ABIs
+        working-directory: tools/box4easy
+        run: |
+          mkdir -p ../../easy-bin
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o ../../easy-bin/box4easy-arm64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -trimpath -ldflags='-s -w' -o ../../easy-bin/box4easy-armv7 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o ../../easy-bin/box4easy-x86_64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=386 go build -trimpath -ldflags='-s -w' -o ../../easy-bin/box4easy-x86 .
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+
+      - name: Build WebUI
+        working-directory: webui
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build flashable module
+        run: sh build.sh
+
+      - name: Inspect flashable ZIP
+        run: |
+          ZIP="$(ls box4easy_*.zip | head -n1)"
+          unzip -t "$ZIP"
+          unzip -l "$ZIP" | grep -q 'module.prop'
+          unzip -l "$ZIP" | grep -q 'customize.sh'
+          unzip -l "$ZIP" | grep -q 'META-INF/com/google/android/update-binary'
+          unzip -l "$ZIP" | grep -q 'webroot/index.html'
+          unzip -l "$ZIP" | grep -q 'easy-bin/box4easy-arm64'
+
+      - name: Upload flashable module
+        uses: actions/upload-artifact@v4
+        with:
+          name: box4easy-v1-flashable
+          path: box4easy_*.zip
+          compression-level: 0
