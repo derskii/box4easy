@@ -8,6 +8,9 @@ on:
       - "README.md"
     tags-ignore:
       - "v*"
+  pull_request:
+    branches:
+      - main
 
 jobs:
   build:
