@@ -1,7 +1,11 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")"
-cat source/main.go.part.* source/v1/*.part > main.go
+: > main.go
+for part in source/main.go.part.* source/v1/*.part; do
+  cat "$part" >> main.go
+  printf '\n' >> main.go
+done
 # 1.0 parser: keep the legacy parser as fallback, but route subscription calls
 # through the broader JSON/Happ-compatible parser.
 sed -i 's/parseJSONSubscription(decodedBody, id)/parseJSONSubscriptionV1(decodedBody, id)/g' main.go
