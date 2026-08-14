@@ -25,7 +25,7 @@ function compatible(node: EasyServer, core: EasyCore) {
   return !node.rawKind;
 }
 
-export function TabEasy({ status, config, actionLoading, handleServiceAction }: Props) {
+export function TabEasy({ status, config, handleServiceAction }: Props) {
   const [state, setState] = useState<EasyState>(EMPTY);
   const [input, setInput] = useState('');
   const [name, setName] = useState('');
