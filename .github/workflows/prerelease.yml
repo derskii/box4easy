@@ -21,9 +21,12 @@ jobs:
           go-version: '1.23.x'
           cache-dependency-path: tools/box4easy/go.mod
 
-      - name: Test Box4Easy helper
+      - name: Materialize and test Box4Easy helper
         working-directory: tools/box4easy
-        run: go test ./...
+        run: |
+          sh materialize.sh
+          go test ./...
+          go vet ./...
 
       - name: Build Box4Easy helpers
         working-directory: tools/box4easy
