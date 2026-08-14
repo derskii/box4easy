@@ -1,0 +1,61 @@
+name: Box4Easy Alpha Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Box4Easy alpha
+        uses: actions/checkout@v4
+        with:
+          ref: agent/core-json-chains
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache-dependency-path: tools/box4easy/go.mod
+
+      - name: Materialize and test helper
+        working-directory: tools/box4easy
+        run: |
+          sh materialize.sh
+          go test ./...
+          go vet ./...
+
+      - name: Build helper binaries
+        working-directory: tools/box4easy
+        run: |
+          mkdir -p ../../easy-bin
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o ../../easy-bin/box4easy-arm64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -trimpath -ldflags='-s -w' -o ../../easy-bin/box4easy-armv7 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o ../../easy-bin/box4easy-x86_64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=386 go build -trimpath -ldflags='-s -w' -o ../../easy-bin/box4easy-x86 .
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+
+      - name: Build WebUI
+        working-directory: webui
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build flashable module ZIP
+        run: sh build.sh
+
+      - name: Upload flashable module
+        uses: actions/upload-artifact@v4
+        with:
+          name: box4easy-alpha-module
+          path: box4easy_*.zip
+          if-no-files-found: error
