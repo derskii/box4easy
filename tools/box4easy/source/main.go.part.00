@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bufio"
 	"bytes"
@@ -27,9 +28,9 @@ import (
 )
 
 const (
-	stateVersion = 2
+	stateVersion = 3
 	maxBodyBytes = 8 << 20
-	defaultUA    = "Box4Easy/0.2"
+	defaultUA    = "Box4Easy/1.0-rc1"
 )
 
 type State struct {
@@ -60,6 +61,14 @@ type Subscription struct {
 	LastError     string        `json:"lastError,omitempty"`
 	NodeCountHint int           `json:"nodeCountHint,omitempty"`
 	Nodes         []ServerEntry `json:"nodes,omitempty"`
+	UserInfo      string        `json:"userInfo,omitempty"`
+	SupportURL    string        `json:"supportUrl,omitempty"`
+	WebURL        string        `json:"webUrl,omitempty"`
+	Announcement  string        `json:"announcement,omitempty"`
+	UpdateHours   int           `json:"updateHours,omitempty"`
+	AutoPing      bool          `json:"autoPing,omitempty"`
+	AutoConnect   bool          `json:"autoConnect,omitempty"`
+	AutoConnectBy string        `json:"autoConnectBy,omitempty"`
 }
 
 type ServerEntry struct {
@@ -92,11 +101,18 @@ type fetchResult struct {
 	RoutingLink string
 	FinalURL    string
 	ContentType string
+	Headers     http.Header
+}
+
+type LatencyResult struct {
+	Ref       string `json:"ref"`
+	LatencyMS int64  `json:"latencyMs,omitempty"`
+	Error     string `json:"error,omitempty"`
 }
 
 func main() {
 	if len(os.Args) < 2 {
-		fatal(errors.New("usage: box4easy <state|ensure-core|enable|disable|add-subscription|update-subscription|update-all|remove-subscription|add-server|remove-server|set-routing|set-mode|set-core|select-node|add-chain|remove-chain|toggle-chain|rebuild>"))
+		fatal(errors.New("usage: box4easy <state|ensure-core|enable|disable|add-subscription|update-subscription|update-all|remove-subscription|add-server|remove-server|set-routing|set-mode|set-core|select-node|latency|latencies|add-chain|remove-chain|toggle-chain|rebuild>"))
 	}
 	cmd := os.Args[1]
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
@@ -169,12 +185,8 @@ func main() {
 		if strings.TrimSpace(*rawURL) == "" {
 			fatal(errors.New("--url is required"))
 		}
-		if !st.EasyEnabled {
-			if err := backupAdvancedConfig(*dir); err != nil {
-				fatal(err)
-			}
-			st.EasyEnabled = true
-		}
+		// Transactional import: no core/TPROXY changes before the payload is parsed.
+		wasEnabled := st.EasyEnabled
 		sub, routing, err := importSubscription(*dir, *name, *rawURL, "")
 		if err != nil {
 			fatal(err)
@@ -191,7 +203,11 @@ func main() {
 		if st.Mode == "" {
 			st.Mode = "routing"
 		}
-		if err := saveAndRebuild(*dir, st); err != nil {
+		if wasEnabled {
+			if err := saveAndRebuild(*dir, st); err != nil {
+				fatal(err)
+			}
+		} else if err := saveState(*dir, st); err != nil {
 			fatal(err)
 		}
 		printJSON(st)
@@ -267,12 +283,7 @@ func main() {
 		if strings.TrimSpace(*uri) == "" {
 			fatal(errors.New("--uri is required"))
 		}
-		if !st.EasyEnabled {
-			if err := backupAdvancedConfig(*dir); err != nil {
-				fatal(err)
-			}
-			st.EasyEnabled = true
-		}
+		wasEnabled := st.EasyEnabled
 		proxy, err := parseProxyURI(strings.TrimSpace(*uri))
 		if err != nil {
 			fatal(err)
@@ -287,7 +298,11 @@ func main() {
 		if st.Mode == "" {
 			st.Mode = "routing"
 		}
-		if err := saveAndRebuild(*dir, st); err != nil {
+		if wasEnabled {
+			if err := saveAndRebuild(*dir, st); err != nil {
+				fatal(err)
+			}
+		} else if err := saveState(*dir, st); err != nil {
 			fatal(err)
 		}
 		printJSON(st)
@@ -348,3 +363,36 @@ func main() {
 			fatal(err)
 		}
 		printJSON(st)
+	case "latency":
+		ref := strings.TrimSpace(*id)
+		if ref == "" {
+			fatal(errors.New("--id is required"))
+		}
+		n, ok := resolveNodeRef(st, ref)
+		if !ok {
+			fatal(fmt.Errorf("unknown node: %s", ref))
+		}
+		printJSON(measureNodeLatency(ref, n))
+	case "latencies":
+		items := allNodes(st)
+		results := make([]LatencyResult, len(items))
+		sem := make(chan struct{}, 8)
+		done := make(chan int, len(items))
+		for i := range items {
+			go func(i int) {
+				sem <- struct{}{}
+				results[i] = measureNodeLatency(items[i].Ref, items[i].Node)
+				<-sem
+				done <- i
+			}(i)
+		}
+		for range items {
+			<-done
+		}
+		printJSON(results)
+	case "add-chain":
+		parts := splitNonEmpty(*hops, ",")
+		if len(parts) < 2 {
+			fatal(errors.New("a chain needs at least two hops"))
+		}
+		for _, ref := range parts {
