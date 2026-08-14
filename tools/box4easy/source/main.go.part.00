@@ -1,0 +1,350 @@
+package main
+
+import (
+	"archive/zip"
+	"bufio"
+	"bytes"
+	"compress/gzip"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+const (
+	stateVersion = 2
+	maxBodyBytes = 8 << 20
+	defaultUA    = "Box4Easy/0.2"
+)
+
+type State struct {
+	Version       int            `json:"version"`
+	EasyEnabled   bool           `json:"easyEnabled"`
+	PreviousCore  string         `json:"previousCore,omitempty"`
+	Core          string         `json:"core"` // sing-box, xray, v2ray, mihomo
+	Mode          string         `json:"mode"` // routing, global, direct
+	ActiveRouting string         `json:"activeRouting,omitempty"`
+	SelectedNode  string         `json:"selectedNode,omitempty"`
+	Subscriptions []Subscription `json:"subscriptions"`
+	Servers       []ServerEntry  `json:"servers"`
+	Routings      []RoutingEntry `json:"routings"`
+	Chains        []ChainEntry   `json:"chains"`
+	UpdatedAt     string         `json:"updatedAt,omitempty"`
+}
+
+type Subscription struct {
+	ID            string        `json:"id"`
+	Name          string        `json:"name"`
+	URL           string        `json:"url"`
+	ProviderKind  string        `json:"providerKind"` // http, file, json
+	ProviderPath  string        `json:"providerPath,omitempty"`
+	SourceFormat  string        `json:"sourceFormat,omitempty"` // uri-list, sing-box-json, xray-json, mihomo-yaml
+	UserAgent     string        `json:"userAgent,omitempty"`
+	RoutingID     string        `json:"routingId,omitempty"`
+	LastUpdate    string        `json:"lastUpdate,omitempty"`
+	LastError     string        `json:"lastError,omitempty"`
+	NodeCountHint int           `json:"nodeCountHint,omitempty"`
+	Nodes         []ServerEntry `json:"nodes,omitempty"`
+}
+
+type ServerEntry struct {
+	ID        string                 `json:"id"`
+	Name      string                 `json:"name"`
+	URI       string                 `json:"uri,omitempty"`
+	SourceSub string                 `json:"sourceSubscription,omitempty"`
+	Proxy     map[string]interface{} `json:"proxy,omitempty"`   // canonical URI-derived proxy fields
+	RawKind   string                 `json:"rawKind,omitempty"` // sing-box or xray
+	Raw       map[string]interface{} `json:"raw,omitempty"`
+}
+
+type RoutingEntry struct {
+	ID         string          `json:"id"`
+	Name       string          `json:"name"`
+	AutoEnable bool            `json:"autoEnable"`
+	SourceSub  string          `json:"sourceSubscription,omitempty"`
+	Raw        json.RawMessage `json:"raw"`
+}
+
+type ChainEntry struct {
+	ID      string   `json:"id"`
+	Name    string   `json:"name"`
+	Hops    []string `json:"hops"` // node refs: local:<id> or sub:<sub-id>:<node-id>
+	Enabled bool     `json:"enabled"`
+}
+
+type fetchResult struct {
+	Body        []byte
+	RoutingLink string
+	FinalURL    string
+	ContentType string
+}
+
+func main() {
+	if len(os.Args) < 2 {
+		fatal(errors.New("usage: box4easy <state|ensure-core|enable|disable|add-subscription|update-subscription|update-all|remove-subscription|add-server|remove-server|set-routing|set-mode|set-core|select-node|add-chain|remove-chain|toggle-chain|rebuild>"))
+	}
+	cmd := os.Args[1]
+	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
+	dir := fs.String("dir", "/data/adb/box/easy", "state directory")
+	name := fs.String("name", "", "name")
+	rawURL := fs.String("url", "", "subscription url")
+	id := fs.String("id", "", "id")
+	uri := fs.String("uri", "", "server uri")
+	mode := fs.String("mode", "", "mode")
+	core := fs.String("core", "", "core")
+	hops := fs.String("hops", "", "comma-separated node refs")
+	previousCore := fs.String("previous-core", "", "previous core")
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		fatal(err)
+	}
+
+	if err := ensureDir(*dir); err != nil {
+		fatal(err)
+	}
+	st, err := loadState(*dir)
+	if err != nil {
+		fatal(err)
+	}
+
+	switch cmd {
+	case "state":
+		printJSON(st)
+	case "ensure-core":
+		targetCore := normalizeCore(*core)
+		if targetCore == "" {
+			targetCore = st.Core
+		}
+		if targetCore == "" {
+			targetCore = "sing-box"
+		}
+		if err := ensureCore(targetCore); err != nil {
+			fatal(err)
+		}
+		printJSON(st)
+	case "enable":
+		if !st.EasyEnabled {
+			if err := backupAdvancedConfig(*dir); err != nil {
+				fatal(err)
+			}
+		}
+		st.EasyEnabled = true
+		if *previousCore != "" {
+			st.PreviousCore = *previousCore
+		}
+		if st.Mode == "" {
+			st.Mode = "routing"
+		}
+		if st.Core == "" {
+			st.Core = "sing-box"
+		}
+		if err := saveAndRebuild(*dir, st); err != nil {
+			fatal(err)
+		}
+		printJSON(st)
+	case "disable":
+		st.EasyEnabled = false
+		if err := saveState(*dir, st); err != nil {
+			fatal(err)
+		}
+		if err := restoreAdvancedConfig(*dir); err != nil {
+			fatal(err)
+		}
+		printJSON(st)
+	case "add-subscription":
+		if strings.TrimSpace(*rawURL) == "" {
+			fatal(errors.New("--url is required"))
+		}
+		if !st.EasyEnabled {
+			if err := backupAdvancedConfig(*dir); err != nil {
+				fatal(err)
+			}
+			st.EasyEnabled = true
+		}
+		sub, routing, err := importSubscription(*dir, *name, *rawURL, "")
+		if err != nil {
+			fatal(err)
+		}
+		st.Subscriptions = append(st.Subscriptions, sub)
+		if routing != nil {
+			routing.SourceSub = sub.ID
+			st.Routings = upsertRouting(st.Routings, *routing)
+			st.Subscriptions[len(st.Subscriptions)-1].RoutingID = routing.ID
+			if routing.AutoEnable || st.ActiveRouting == "" {
+				st.ActiveRouting = routing.ID
+			}
+		}
+		if st.Mode == "" {
+			st.Mode = "routing"
+		}
+		if err := saveAndRebuild(*dir, st); err != nil {
+			fatal(err)
+		}
+		printJSON(st)
+	case "update-subscription":
+		if *id == "" {
+			fatal(errors.New("--id is required"))
+		}
+		idx := findSubscription(st.Subscriptions, *id)
+		if idx < 0 {
+			fatal(errors.New("subscription not found"))
+		}
+		old := st.Subscriptions[idx]
+		sub, routing, err := importSubscription(*dir, old.Name, old.URL, old.ID)
+		if err != nil {
+			st.Subscriptions[idx].LastError = err.Error()
+			_ = saveState(*dir, st)
+			fatal(err)
+		}
+		st.Subscriptions[idx] = sub
+		if routing != nil {
+			routing.SourceSub = sub.ID
+			st.Routings = upsertRouting(st.Routings, *routing)
+			st.Subscriptions[idx].RoutingID = routing.ID
+			if routing.AutoEnable {
+				st.ActiveRouting = routing.ID
+			}
+		} else {
+			st.Subscriptions[idx].RoutingID = old.RoutingID
+		}
+		if err := saveAndRebuild(*dir, st); err != nil {
+			fatal(err)
+		}
+		printJSON(st)
+	case "update-all":
+		for i := range st.Subscriptions {
+			old := st.Subscriptions[i]
+			sub, routing, e := importSubscription(*dir, old.Name, old.URL, old.ID)
+			if e != nil {
+				st.Subscriptions[i].LastError = e.Error()
+				continue
+			}
+			st.Subscriptions[i] = sub
+			if routing != nil {
+				routing.SourceSub = sub.ID
+				st.Routings = upsertRouting(st.Routings, *routing)
+				st.Subscriptions[i].RoutingID = routing.ID
+				if routing.AutoEnable {
+					st.ActiveRouting = routing.ID
+				}
+			} else {
+				st.Subscriptions[i].RoutingID = old.RoutingID
+			}
+		}
+		if err := saveAndRebuild(*dir, st); err != nil {
+			fatal(err)
+		}
+		printJSON(st)
+	case "remove-subscription":
+		if *id == "" {
+			fatal(errors.New("--id is required"))
+		}
+		st.Subscriptions = removeSubscription(st.Subscriptions, *id)
+		st.Routings = removeRoutingsBySub(st.Routings, *id)
+		if findRouting(st.Routings, st.ActiveRouting) < 0 {
+			st.ActiveRouting = ""
+		}
+		_ = os.Remove(filepath.Join(*dir, "providers", safeID(*id)+".yaml"))
+		if err := saveAndRebuild(*dir, st); err != nil {
+			fatal(err)
+		}
+		printJSON(st)
+	case "add-server":
+		if strings.TrimSpace(*uri) == "" {
+			fatal(errors.New("--uri is required"))
+		}
+		if !st.EasyEnabled {
+			if err := backupAdvancedConfig(*dir); err != nil {
+				fatal(err)
+			}
+			st.EasyEnabled = true
+		}
+		proxy, err := parseProxyURI(strings.TrimSpace(*uri))
+		if err != nil {
+			fatal(err)
+		}
+		n := stringValue(proxy["name"])
+		if *name != "" {
+			n = *name
+			proxy["name"] = n
+		}
+		entry := ServerEntry{ID: newID("srv"), Name: n, URI: strings.TrimSpace(*uri), Proxy: proxy}
+		st.Servers = append(st.Servers, entry)
+		if st.Mode == "" {
+			st.Mode = "routing"
+		}
+		if err := saveAndRebuild(*dir, st); err != nil {
+			fatal(err)
+		}
+		printJSON(st)
+	case "remove-server":
+		if *id == "" {
+			fatal(errors.New("--id is required"))
+		}
+		st.Servers = removeServer(st.Servers, *id)
+		if err := saveAndRebuild(*dir, st); err != nil {
+			fatal(err)
+		}
+		printJSON(st)
+	case "set-routing":
+		if *id == "off" || *id == "" {
+			st.ActiveRouting = ""
+		} else if findRouting(st.Routings, *id) < 0 {
+			fatal(errors.New("routing profile not found"))
+		} else {
+			st.ActiveRouting = *id
+		}
+		if err := saveAndRebuild(*dir, st); err != nil {
+			fatal(err)
+		}
+		printJSON(st)
+	case "set-mode":
+		switch *mode {
+		case "routing", "global", "direct":
+			st.Mode = *mode
+		default:
+			fatal(errors.New("--mode must be routing, global or direct"))
+		}
+		if err := saveAndRebuild(*dir, st); err != nil {
+			fatal(err)
+		}
+		printJSON(st)
+	case "set-core":
+		targetCore := normalizeCore(*core)
+		if targetCore == "" {
+			fatal(errors.New("--core must be sing-box, xray, v2ray or mihomo"))
+		}
+		if err := ensureCore(targetCore); err != nil {
+			fatal(err)
+		}
+		st.Core = targetCore
+		if err := saveAndRebuild(*dir, st); err != nil {
+			fatal(err)
+		}
+		printJSON(st)
+	case "select-node":
+		ref := strings.TrimSpace(*id)
+		if ref != "" && ref != "auto" {
+			if _, ok := resolveNodeRef(st, ref); !ok {
+				fatal(fmt.Errorf("unknown node: %s", ref))
+			}
+		}
+		st.SelectedNode = ref
+		if err := saveAndRebuild(*dir, st); err != nil {
+			fatal(err)
+		}
+		printJSON(st)
