@@ -1,3 +1,157 @@
+	}
+	host, port, err := hostPort(u)
+	if err != nil {
+		return nil, err
+	}
+	password := ""
+	if u.User != nil {
+		password = u.User.Username()
+	}
+	if password == "" {
+		return nil, errors.New("trojan password is missing")
+	}
+	q := u.Query()
+	p := map[string]interface{}{"name": nodeName(u, host), "type": "trojan", "server": host, "port": port, "password": password, "udp": true}
+	if sni := firstNonEmpty(q.Get("sni"), q.Get("peer"), q.Get("servername")); sni != "" {
+		p["sni"] = sni
+	}
+	if fp := q.Get("fp"); fp != "" {
+		p["client-fingerprint"] = fp
+	}
+	if q.Get("allowInsecure") == "1" || strings.EqualFold(q.Get("insecure"), "true") {
+		p["skip-cert-verify"] = true
+	}
+	applyTransport(p, q)
+	return p, nil
+}
+
+func parseHysteria2(raw string) (map[string]interface{}, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	host, port, err := hostPort(u)
+	if err != nil {
+		return nil, err
+	}
+	password := ""
+	if u.User != nil {
+		password = u.User.Username()
+		if pw, ok := u.User.Password(); ok && pw != "" {
+			password = pw
+		}
+	}
+	if password == "" {
+		return nil, errors.New("hysteria2 password is missing")
+	}
+	q := u.Query()
+	p := map[string]interface{}{"name": nodeName(u, host), "type": "hysteria2", "server": host, "port": port, "password": password}
+	if sni := q.Get("sni"); sni != "" {
+		p["sni"] = sni
+	}
+	if q.Get("insecure") == "1" || strings.EqualFold(q.Get("insecure"), "true") {
+		p["skip-cert-verify"] = true
+	}
+	if obfs := q.Get("obfs"); obfs != "" {
+		p["obfs"] = obfs
+	}
+	if op := firstNonEmpty(q.Get("obfs-password"), q.Get("obfsPassword")); op != "" {
+		p["obfs-password"] = op
+	}
+	if up := q.Get("up"); up != "" {
+		p["up"] = up
+	}
+	if down := q.Get("down"); down != "" {
+		p["down"] = down
+	}
+	return p, nil
+}
+
+func parseVMess(raw string) (map[string]interface{}, error) {
+	payload := strings.TrimPrefix(raw, "vmess://")
+	payload = strings.TrimSpace(payload)
+	var decoded []byte
+	var err error
+	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+		decoded, err = enc.DecodeString(payload)
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		return nil, errors.New("invalid vmess base64")
+	}
+	var v map[string]interface{}
+	if err := json.Unmarshal(decoded, &v); err != nil {
+		return nil, errors.New("invalid vmess json")
+	}
+	host := firstString(v, "add", "host")
+	id := firstString(v, "id")
+	if host == "" || id == "" {
+		return nil, errors.New("vmess host/id missing")
+	}
+	port, _ := strconv.Atoi(firstString(v, "port"))
+	if port == 0 {
+		port = intValue(v["port"])
+	}
+	if port == 0 {
+		return nil, errors.New("vmess port missing")
+	}
+	name := firstString(v, "ps", "name")
+	if name == "" {
+		name = host
+	}
+	p := map[string]interface{}{"name": name, "type": "vmess", "server": host, "port": port, "uuid": id, "alterId": intValue(v["aid"]), "cipher": "auto", "udp": true}
+	if tls := strings.ToLower(firstString(v, "tls")); tls == "tls" {
+		p["tls"] = true
+	}
+	if sni := firstString(v, "sni", "serverName"); sni != "" {
+		p["servername"] = sni
+	}
+	if fp := firstString(v, "fp"); fp != "" {
+		p["client-fingerprint"] = fp
+	}
+	netType := firstString(v, "net")
+	if netType != "" && netType != "tcp" {
+		p["network"] = netType
+		switch netType {
+		case "ws":
+			opts := map[string]interface{}{}
+			if path := firstString(v, "path"); path != "" {
+				opts["path"] = path
+			}
+			if h := firstString(v, "host"); h != "" {
+				opts["headers"] = map[string]interface{}{"Host": h}
+			}
+			p["ws-opts"] = opts
+		case "grpc":
+			p["grpc-opts"] = map[string]interface{}{"grpc-service-name": firstString(v, "path")}
+		}
+	}
+	return p, nil
+}
+
+func parseSS(raw string) (map[string]interface{}, error) {
+	rest := strings.TrimPrefix(raw, "ss://")
+	frag := ""
+	if i := strings.Index(rest, "#"); i >= 0 {
+		frag, _ = url.QueryUnescape(rest[i+1:])
+		rest = rest[:i]
+	}
+	var userinfo, hostport string
+	if at := strings.LastIndex(rest, "@"); at >= 0 {
+		userinfo, hostport = rest[:at], rest[at+1:]
+		if dec := decodeB64String(userinfo); dec != "" {
+			userinfo = dec
+		}
+	} else {
+		dec := decodeB64String(rest)
+		if dec == "" {
+			return nil, errors.New("invalid ss base64")
+		}
+		at := strings.LastIndex(dec, "@")
+		if at < 0 {
+			return nil, errors.New("invalid ss payload")
 		}
 		userinfo, hostport = dec[:at], dec[at+1:]
 	}
@@ -160,6 +314,56 @@ func removeChain(chains []ChainEntry, id string) []ChainEntry {
 	return out
 }
 
+func measureNodeLatency(ref string, n ServerEntry) LatencyResult {
+	host, port, err := nodeEndpoint(n)
+	if err != nil {
+		return LatencyResult{Ref: ref, Error: err.Error()}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	d := net.Dialer{Timeout: 2300 * time.Millisecond}
+	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	if err != nil {
+		return LatencyResult{Ref: ref, Error: "timeout"}
+	}
+	_ = conn.Close()
+	return LatencyResult{Ref: ref, LatencyMS: time.Since(start).Milliseconds()}
+}
+
+func nodeEndpoint(n ServerEntry) (string, int, error) {
+	if n.Proxy != nil {
+		h := strings.TrimSpace(stringValue(n.Proxy["server"]))
+		p := intValue(n.Proxy["port"])
+		if h != "" && p > 0 {
+			return h, p, nil
+		}
+	}
+	if n.RawKind == "sing-box" && n.Raw != nil {
+		h := strings.TrimSpace(stringValue(n.Raw["server"]))
+		p := intValue(n.Raw["server_port"])
+		if h != "" && p > 0 {
+			return h, p, nil
+		}
+	}
+	if n.RawKind == "xray" && n.Raw != nil {
+		if settings, ok := n.Raw["settings"].(map[string]interface{}); ok {
+			for _, key := range []string{"vnext", "servers"} {
+				if arr, ok := settings[key].([]interface{}); ok && len(arr) > 0 {
+					if m, ok := arr[0].(map[string]interface{}); ok {
+						h := firstNonEmpty(stringValue(m["address"]), stringValue(m["server"]))
+						p := intValue(m["port"])
+						if h != "" && p > 0 {
+							return h, p, nil
+						}
+					}
+				}
+			}
+		}
+	}
+	return "", 0, errors.New("server address is unavailable")
+}
+
 func allNodes(st State) []struct {
 	Ref   string
 	Node  ServerEntry
@@ -190,161 +394,3 @@ func allNodes(st State) []struct {
 }
 
 func singBoxOutboundFromNode(n ServerEntry, tag string) (map[string]interface{}, error) {
-	if n.RawKind == "sing-box" && n.Raw != nil {
-		m := cloneMap(n.Raw)
-		m["tag"] = tag
-		return m, nil
-	}
-	if n.RawKind == "xray" {
-		return nil, errors.New("Xray-only JSON node cannot be used by sing-box")
-	}
-	p := n.Proxy
-	if p == nil {
-		return nil, errors.New("empty node")
-	}
-	typ := strings.ToLower(stringValue(p["type"]))
-	server := stringValue(p["server"])
-	port := intValue(p["port"])
-	if server == "" || port == 0 {
-		return nil, errors.New("server/port missing")
-	}
-	m := map[string]interface{}{"type": typ, "tag": tag, "server": server, "server_port": port}
-	switch typ {
-	case "vless":
-		m["uuid"] = stringValue(p["uuid"])
-		if flow := stringValue(p["flow"]); flow != "" {
-			m["flow"] = flow
-		}
-		applySingBoxTLS(m, p, true)
-		applySingBoxTransport(m, p)
-	case "vmess":
-		m["uuid"] = stringValue(p["uuid"])
-		m["security"] = "auto"
-		if aid := intValue(p["alterId"]); aid != 0 {
-			m["alter_id"] = aid
-		}
-		applySingBoxTLS(m, p, false)
-		applySingBoxTransport(m, p)
-	case "trojan":
-		m["password"] = stringValue(p["password"])
-		applySingBoxTLS(m, p, true)
-		applySingBoxTransport(m, p)
-	case "hysteria2":
-		m["password"] = stringValue(p["password"])
-		applySingBoxTLS(m, p, true)
-		if obfs := stringValue(p["obfs"]); obfs != "" {
-			ob := map[string]interface{}{"type": obfs}
-			if pass := stringValue(p["obfs-password"]); pass != "" {
-				ob["password"] = pass
-			}
-			m["obfs"] = ob
-		}
-		if up := bandwidthMbps(p["up"]); up > 0 {
-			m["up_mbps"] = up
-		}
-		if down := bandwidthMbps(p["down"]); down > 0 {
-			m["down_mbps"] = down
-		}
-	case "ss":
-		m["type"] = "shadowsocks"
-		m["method"] = stringValue(p["cipher"])
-		m["password"] = stringValue(p["password"])
-	case "socks5", "socks":
-		m["type"] = "socks"
-		m["version"] = "5"
-		if v := stringValue(p["username"]); v != "" {
-			m["username"] = v
-		}
-		if v := stringValue(p["password"]); v != "" {
-			m["password"] = v
-		}
-	default:
-		return nil, fmt.Errorf("protocol %s is not supported by sing-box generator", typ)
-	}
-	return m, nil
-}
-
-func bandwidthMbps(v interface{}) int {
-	s := strings.ToLower(strings.TrimSpace(stringValue(v)))
-	if s == "" {
-		return 0
-	}
-	s = strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(s, "mbps"), "mb"), "m")
-	n, _ := strconv.Atoi(strings.TrimSpace(s))
-	return n
-}
-
-func applySingBoxTLS(m, p map[string]interface{}, force bool) {
-	enabled := force || boolish(p["tls"], false) || stringValue(p["sni"]) != "" || stringValue(p["servername"]) != ""
-	if !enabled {
-		return
-	}
-	t := map[string]interface{}{"enabled": true}
-	if sni := firstNonEmpty(stringValue(p["servername"]), stringValue(p["sni"])); sni != "" {
-		t["server_name"] = sni
-	}
-	if boolish(p["skip-cert-verify"], false) {
-		t["insecure"] = true
-	}
-	if fp := stringValue(p["client-fingerprint"]); fp != "" {
-		t["utls"] = map[string]interface{}{"enabled": true, "fingerprint": fp}
-	}
-	if ro, ok := p["reality-opts"].(map[string]interface{}); ok {
-		r := map[string]interface{}{"enabled": true}
-		if v := stringValue(ro["public-key"]); v != "" {
-			r["public_key"] = v
-		}
-		if v := stringValue(ro["short-id"]); v != "" {
-			r["short_id"] = v
-		}
-		if len(r) > 1 {
-			t["reality"] = r
-		}
-	}
-	m["tls"] = t
-}
-
-func applySingBoxTransport(m, p map[string]interface{}) {
-	network := strings.ToLower(stringValue(p["network"]))
-	switch network {
-	case "ws":
-		t := map[string]interface{}{"type": "ws"}
-		if o, ok := p["ws-opts"].(map[string]interface{}); ok {
-			if v := o["path"]; v != nil && stringValue(v) != "" {
-				t["path"] = stringValue(v)
-			}
-			if v := o["headers"]; v != nil {
-				t["headers"] = v
-			}
-			if v := o["max-early-data"]; v != nil {
-				t["max_early_data"] = intValue(v)
-			}
-		}
-		m["transport"] = t
-	case "grpc":
-		t := map[string]interface{}{"type": "grpc"}
-		if o, ok := p["grpc-opts"].(map[string]interface{}); ok {
-			if v := stringValue(o["grpc-service-name"]); v != "" {
-				t["service_name"] = v
-			}
-		}
-		m["transport"] = t
-	case "http", "h2":
-		t := map[string]interface{}{"type": "http"}
-		if o, ok := p["http-opts"].(map[string]interface{}); ok {
-			if v := o["path"]; v != nil {
-				t["path"] = v
-			}
-			if v := o["headers"]; v != nil {
-				t["headers"] = v
-			}
-		}
-		m["transport"] = t
-	}
-}
-
-func uniqueTag(base string, used map[string]int) string {
-	base = strings.TrimSpace(base)
-	if base == "" {
-		base = "Proxy"
-	}
