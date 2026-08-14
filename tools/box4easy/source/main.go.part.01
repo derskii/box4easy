@@ -1,57 +1,51 @@
-	case "add-chain":
-		parts := splitNonEmpty(*hops, ",")
-		if len(parts) < 2 {
-			fatal(errors.New("a chain needs at least two hops"))
-		}
-		for _, ref := range parts {
 			if _, ok := resolveNodeRef(st, ref); !ok {
 				fatal(fmt.Errorf("unknown chain node: %s", ref))
 			}
-		}
-		chainName := strings.TrimSpace(*name)
-		if chainName == "" {
-			chainName = "Chain " + strconv.Itoa(len(st.Chains)+1)
-		}
-		st.Chains = append(st.Chains, ChainEntry{ID: newID("chain"), Name: chainName, Hops: parts, Enabled: true})
-		if err := saveAndRebuild(*dir, st); err != nil {
-			fatal(err)
-		}
-		printJSON(st)
-	case "remove-chain":
-		if *id == "" {
-			fatal(errors.New("--id is required"))
-		}
-		st.Chains = removeChain(st.Chains, *id)
-		if err := saveAndRebuild(*dir, st); err != nil {
-			fatal(err)
-		}
-		printJSON(st)
-	case "toggle-chain":
-		if *id == "" {
-			fatal(errors.New("--id is required"))
-		}
-		found := false
-		for i := range st.Chains {
-			if st.Chains[i].ID == *id {
-				st.Chains[i].Enabled = !st.Chains[i].Enabled
-				found = true
-			}
-		}
-		if !found {
-			fatal(errors.New("chain not found"))
-		}
-		if err := saveAndRebuild(*dir, st); err != nil {
-			fatal(err)
-		}
-		printJSON(st)
-	case "rebuild":
-		if err := saveAndRebuild(*dir, st); err != nil {
-			fatal(err)
-		}
-		printJSON(st)
-	default:
-		fatal(fmt.Errorf("unknown command: %s", cmd))
 	}
+	chainName := strings.TrimSpace(*name)
+	if chainName == "" {
+		chainName = "Chain " + strconv.Itoa(len(st.Chains)+1)
+	}
+	st.Chains = append(st.Chains, ChainEntry{ID: newID("chain"), Name: chainName, Hops: parts, Enabled: true})
+	if err := saveAndRebuild(*dir, st); err != nil {
+		fatal(err)
+	}
+	printJSON(st)
+case "remove-chain":
+	if *id == "" {
+		fatal(errors.New("--id is required"))
+	}
+	st.Chains = removeChain(st.Chains, *id)
+	if err := saveAndRebuild(*dir, st); err != nil {
+		fatal(err)
+	}
+	printJSON(st)
+case "toggle-chain":
+	if *id == "" {
+		fatal(errors.New("--id is required"))
+	}
+	found := false
+	for i := range st.Chains {
+		if st.Chains[i].ID == *id {
+			st.Chains[i].Enabled = !st.Chains[i].Enabled
+			found = true
+		}
+	}
+	if !found {
+		fatal(errors.New("chain not found"))
+	}
+	if err := saveAndRebuild(*dir, st); err != nil {
+		fatal(err)
+	}
+	printJSON(st)
+case "rebuild":
+	if err := saveAndRebuild(*dir, st); err != nil {
+		fatal(err)
+	}
+	printJSON(st)
+default:
+	fatal(fmt.Errorf("unknown command: %s", cmd))
+}
 }
 
 func ensureDir(dir string) error {
@@ -191,160 +185,214 @@ func importSubscription(dir, name, rawURL, forceID string) (Subscription, *Routi
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
 		return Subscription{}, nil, errors.New("subscription URL must be http(s)")
 	}
-	if name == "" {
-		name = u.Hostname()
-		if name == "" {
-			name = "Subscription"
-		}
-	}
 	id := forceID
 	if id == "" {
 		id = newID("sub")
 	}
 
-	// Prefer a generic client UA first. Many modern panels return sing-box JSON,
-	// URI lists or base64 payloads depending on UA/query parameters.
-	fr, err := fetchSubscription(rawURL, "sing-box Box4Easy/0.2")
-	if err != nil {
-		return Subscription{}, nil, err
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	uas := []string{
+		"Happ/Android Box4Easy/1.0",
+		"sing-box/1.13 Box4Easy/1.0",
+		"v2rayNG/1.10 Box4Easy/1.0",
+		"Clash.Meta/1.19 Mihomo",
 	}
-	routing := parseRoutingLink(fr.RoutingLink)
-	if routing == nil {
-		if link := findRoutingInBody(fr.Body); link != "" {
-			routing = parseRoutingLink(link)
+
+	var chosen fetchResult
+	var chosenUA string
+	var chosenFormat string
+	var chosenKind string
+	var chosenBody []byte
+	var chosenLinks []string
+	var chosenNodes []ServerEntry
+	var lastErr error
+
+	for _, ua := range uas {
+		if ctx.Err() != nil {
+			break
 		}
+		fr, e := fetchSubscriptionCtx(ctx, rawURL, ua)
+		if e != nil {
+			lastErr = e
+			continue
+		}
+		decoded, links, count := normalizeSubscriptionBody(fr.Body)
+		if count > 0 {
+			chosen, chosenUA, chosenFormat, chosenKind, chosenBody, chosenLinks = fr, ua, "uri-list", "file", decoded, links
+			break
+		}
+		if format, nodes, ok := parseJSONSubscription(decoded, id); ok && len(nodes) > 0 {
+			chosen, chosenUA, chosenFormat, chosenKind, chosenBody, chosenNodes = fr, ua, format, "json", decoded, nodes
+			break
+		}
+		if looksLikeClashYAML(decoded) {
+			chosen, chosenUA, chosenFormat, chosenKind, chosenBody = fr, ua, "mihomo-yaml", "http", decoded
+			continue
+		}
+		lastErr = errors.New("unrecognized response")
+	}
+	if chosenFormat == "" {
+		if ctx.Err() == context.DeadlineExceeded {
+			return Subscription{}, nil, errors.New("timeout while adding subscription (10s)")
+		}
+		if lastErr != nil {
+			return Subscription{}, nil, fmt.Errorf("subscription import failed: %w", lastErr)
+		}
+		return Subscription{}, nil, errors.New("subscription format is not recognized")
 	}
 
-	body := fr.Body
-	decodedBody, links, linkCount := normalizeSubscriptionBody(body)
-	kind := "file"
-	providerPath := ""
-	ua := "sing-box Box4Easy/0.2"
-	sourceFormat := ""
-	nodes := []ServerEntry{}
+	meta := parseSubscriptionMetadata(chosen.Headers, chosenBody)
+	if strings.TrimSpace(name) == "" {
+		name = firstNonEmpty(meta["profile-title"], u.Hostname(), "Подписка")
+	}
+	name = strings.TrimSpace(name)
 
-	if linkCount > 0 {
-		sourceFormat = "uri-list"
+	routing := parseRoutingLink(chosen.RoutingLink)
+	if routing == nil {
+		routing = parseRoutingLink(findRoutingInBody(chosen.Body))
+	}
+
+	providerPath := ""
+	nodes := chosenNodes
+	if chosenFormat == "uri-list" {
 		providerPath = filepath.Join(dir, "providers", safeID(id)+".yaml")
-		if err := writeProviderFromLinks(providerPath, links); err != nil {
+		if err := writeProviderFromLinks(providerPath, chosenLinks); err != nil {
 			return Subscription{}, routing, err
 		}
-		for i, link := range links {
+		for i, link := range chosenLinks {
 			proxy, e := parseProxyURI(link)
 			if e != nil {
 				continue
 			}
 			n := stringValue(proxy["name"])
+			if n == "" {
+				n = fmt.Sprintf("Сервер %d", i+1)
+			}
 			nodes = append(nodes, ServerEntry{ID: fmt.Sprintf("%s-n%d", safeID(id), i+1), Name: n, URI: link, SourceSub: id, Proxy: proxy})
 		}
-		linkCount = len(nodes)
-	} else if format, parsedNodes, ok := parseJSONSubscription(decodedBody, id); ok {
-		sourceFormat = format
-		kind = "json"
-		nodes = parsedNodes
-		linkCount = len(nodes)
+	} else if chosenKind == "json" {
 		providerPath = filepath.Join(dir, "providers", safeID(id)+".json")
-		if err := atomicWrite(providerPath, decodedBody, 0644); err != nil {
+		if err := atomicWrite(providerPath, chosenBody, 0644); err != nil {
 			return Subscription{}, routing, err
 		}
-	} else {
-		yamlFallback := looksLikeClashYAML(decodedBody)
-		// Retry before accepting YAML: many panels return Clash by default but
-		// return URI/Xray JSON when the UA looks like a V2Ray client.
-		for _, retryUA := range []string{"v2rayNG/1.10 Box4Easy/0.2", "Clash.Meta/1.19.8 Mihomo"} {
-			fr2, e2 := fetchSubscription(rawURL, retryUA)
-			if e2 != nil {
-				continue
-			}
-			if routing == nil {
-				routing = parseRoutingLink(fr2.RoutingLink)
-				if routing == nil {
-					routing = parseRoutingLink(findRoutingInBody(fr2.Body))
-				}
-			}
-			d2, l2, c2 := normalizeSubscriptionBody(fr2.Body)
-			if c2 > 0 {
-				sourceFormat, kind, ua = "uri-list", "file", retryUA
-				providerPath = filepath.Join(dir, "providers", safeID(id)+".yaml")
-				if err := writeProviderFromLinks(providerPath, l2); err != nil {
-					return Subscription{}, routing, err
-				}
-				for i, link := range l2 {
-					proxy, e := parseProxyURI(link)
-					if e != nil {
-						continue
-					}
-					nodes = append(nodes, ServerEntry{ID: fmt.Sprintf("%s-n%d", safeID(id), i+1), Name: stringValue(proxy["name"]), URI: link, SourceSub: id, Proxy: proxy})
-				}
-				linkCount = len(nodes)
-				break
-			}
-			if format, parsedNodes, ok := parseJSONSubscription(d2, id); ok {
-				sourceFormat, kind, ua = format, "json", retryUA
-				nodes = parsedNodes
-				linkCount = len(nodes)
-				providerPath = filepath.Join(dir, "providers", safeID(id)+".json")
-				if err := atomicWrite(providerPath, d2, 0644); err != nil {
-					return Subscription{}, routing, err
-				}
-				break
-			}
-			if looksLikeClashYAML(d2) {
-				sourceFormat, kind, ua = "mihomo-yaml", "http", retryUA
-				break
-			}
-		}
-		if sourceFormat == "" && yamlFallback {
-			sourceFormat, kind, ua = "mihomo-yaml", "http", "Clash.Meta/1.19.8 Mihomo"
-		}
-		if sourceFormat == "" {
-			return Subscription{}, routing, errors.New("subscription format is not recognized (expected URI/base64, sing-box/Xray JSON or Mihomo YAML)")
-		}
+	}
+	if len(nodes) == 0 && chosenFormat != "mihomo-yaml" {
+		return Subscription{}, routing, errors.New("subscription parsed but contains no supported servers")
 	}
 
-	now := time.Now().UTC().Format(time.RFC3339)
-	sub := Subscription{ID: id, Name: name, URL: rawURL, ProviderKind: kind, ProviderPath: providerPath, SourceFormat: sourceFormat, UserAgent: ua, LastUpdate: now, NodeCountHint: linkCount, Nodes: nodes}
+	updateHours, _ := strconv.Atoi(strings.TrimSpace(meta["profile-update-interval"]))
+	sub := Subscription{
+		ID: id, Name: name, URL: rawURL, ProviderKind: chosenKind, ProviderPath: providerPath,
+		SourceFormat: chosenFormat, UserAgent: chosenUA, LastUpdate: time.Now().UTC().Format(time.RFC3339),
+		NodeCountHint: len(nodes), Nodes: nodes, UserInfo: meta["subscription-userinfo"],
+		SupportURL: meta["support-url"], WebURL: meta["profile-web-page-url"], Announcement: decodeMetaText(meta["announce"]),
+		UpdateHours: updateHours, AutoPing: truthyString(meta["subscription-ping-onopen-enabled"]),
+		AutoConnect: truthyString(meta["subscription-autoconnect"]), AutoConnectBy: meta["subscription-autoconnect-type"],
+	}
 	if routing != nil {
 		sub.RoutingID = routing.ID
 	}
 	return sub, routing, nil
 }
 
+func parseSubscriptionMetadata(headers http.Header, body []byte) map[string]string {
+	keys := []string{"profile-title", "subscription-userinfo", "profile-update-interval", "support-url", "profile-web-page-url", "announce", "subscription-ping-onopen-enabled", "subscription-autoconnect", "subscription-autoconnect-type", "change-user-agent"}
+	out := map[string]string{}
+	for _, k := range keys {
+		if v := strings.TrimSpace(headers.Get(k)); v != "" {
+			out[k] = v
+		}
+	}
+	s := bufio.NewScanner(bytes.NewReader(body))
+	for s.Scan() {
+		line := strings.TrimSpace(s.Text())
+		if !strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimSpace(strings.TrimPrefix(line, "#"))
+		for _, sep := range []string{":", " "} {
+			if i := strings.Index(line, sep); i > 0 {
+				k := strings.ToLower(strings.TrimSpace(line[:i]))
+				v := strings.TrimSpace(line[i+len(sep):])
+				for _, allowed := range keys {
+					if k == allowed && v != "" {
+						out[k] = v
+					}
+				}
+				break
+			}
+		}
+	}
+	return out
+}
+
+func truthyString(v string) bool {
+	v = strings.ToLower(strings.TrimSpace(v))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+func decodeMetaText(v string) string {
+	v = strings.TrimSpace(v)
+	if strings.HasPrefix(strings.ToLower(v), "base64:") {
+		b, err := base64.StdEncoding.DecodeString(strings.TrimSpace(v[len("base64:"):]))
+		if err == nil {
+			return string(b)
+		}
+	}
+	return v
+}
+
 func parseJSONSubscription(body []byte, subID string) (string, []ServerEntry, bool) {
-	var root map[string]interface{}
+	var root interface{}
 	if json.Unmarshal(bytes.TrimSpace(body), &root) != nil {
 		return "", nil, false
 	}
-	arr, ok := root["outbounds"].([]interface{})
-	if !ok || len(arr) == 0 {
-		return "", nil, false
-	}
-	format := ""
-	for _, item := range arr {
-		m, _ := item.(map[string]interface{})
-		if m == nil {
-			continue
-		}
-		if stringValue(m["type"]) != "" {
-			format = "sing-box-json"
-			break
-		}
-		if stringValue(m["protocol"]) != "" {
-			format = "xray-json"
-			break
-		}
-	}
-	if format == "" {
-		return "", nil, false
-	}
-	var nodes []ServerEntry
-	for i, item := range arr {
-		m, _ := item.(map[string]interface{})
-		if m == nil {
-			continue
-		}
-		if format == "sing-box-json" {
-			typ := strings.ToLower(stringValue(m["type"]))
-			if typ == "" || typ == "direct" || typ == "block" || typ == "selector" || typ == "urltest" || typ == "dns" {
-				continue
+	var items []interface{}
+	format := "json-array"
+	switch v := root.(type) {
+	case []interface{}:
+		items = v
+	case map[string]interface{}:
+		for _, key := range []string{"outbounds", "configs", "servers", "proxies", "data", "items"} {
+			if a, ok := v[key].([]interface{}); ok && len(a) > 0 {
+				items = a
+				break
 			}
+		}
+		if len(items) == 0 {
+			if data, ok := v["data"].(string); ok {
+				decoded, links, count := normalizeSubscriptionBody([]byte(data))
+				_ = decoded
+				if count > 0 {
+					for _, link := range links {
+						items = append(items, link)
+					}
+				}
+			}
+		}
+	default:
+		return "", nil, false
+	}
+	if len(items) == 0 {
+		return "", nil, false
+	}
+
+	var nodes []ServerEntry
+	seenSing, seenXray := false, false
+	for i, item := range items {
+		id := fmt.Sprintf("%s-j%d", safeID(subID), i+1)
+		switch v := item.(type) {
+		case string:
+			links := extractLinks(v)
+			if len(links) == 0 {
+				links = []string{strings.TrimSpace(v)}
+			}
+			for _, link := range links {
+				if !linkRE.MatchString(link) {
+					continue
+				}
+				p, err := parseProxyURI(link)
+				if err != nil {
+					continue
+				}
