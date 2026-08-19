@@ -1,7 +1,6 @@
 id=box4
-name=box4magisk
-version=v5.2pre
-versionCode=2025010509
-author=CHIZI-0618
-description=Use sing-box, clash, v2ray, xray tunnel proxy on Android devices.
-updateJson=https://raw.githubusercontent.com/CHIZI-0618/box4magisk/main/box4.json
+name=Box4Easy
+version=v1.0.0
+versionCode=2026081410
+author=CHIZI-0618 / derskii / Box4Easy
+description=Root-first transparent proxy manager with safe JSON/URI subscription import, sing-box-first core management, TPROXY, node latency tests, routing profiles and multi-hop chains.

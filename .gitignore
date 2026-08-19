@@ -1,4 +1,7 @@
 ui/node_modules/
+webui/node_modules/
 webroot/
+easy-bin/
+tools/box4easy/main.go
 .ai_memory
 *.zip

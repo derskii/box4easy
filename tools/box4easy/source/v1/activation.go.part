@@ -1,0 +1,17 @@
+
+// markV1Activated is called only after the generated core configuration has
+// validated successfully. Until then the boot service keeps Box in manual mode
+// so a stale alpha configuration cannot hijack networking after an upgrade.
+func markV1Activated(dir string) error {
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "v1.activated"), []byte("ok\n"), 0600); err != nil {
+		return err
+	}
+	manual := filepath.Join(boxRoot(), "manual")
+	if err := os.Remove(manual); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}

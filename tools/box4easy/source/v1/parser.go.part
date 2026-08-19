@@ -1,0 +1,148 @@
+
+// parseJSONSubscriptionV1 extends the legacy parser without weakening validation.
+// It accepts full sing-box/Xray configs, top-level arrays, and common nested
+// subscription containers used by mobile clients/panels.
+func parseJSONSubscriptionV1(body []byte, subID string) (string, []ServerEntry, bool) {
+	body = bytes.TrimSpace(bytes.TrimPrefix(body, []byte{0xef, 0xbb, 0xbf}))
+	if format, nodes, ok := parseJSONSubscription(body, subID); ok {
+		return format, nodes, true
+	}
+
+	candidates := [][]byte{body}
+	if decoded, ok := decodeMaybeBase64JSON(body); ok {
+		candidates = append(candidates, decoded)
+	}
+	for _, candidate := range candidates {
+		var root interface{}
+		if json.Unmarshal(candidate, &root) != nil {
+			continue
+		}
+		nodes := collectJSONNodes(root, subID)
+		if len(nodes) > 0 {
+			return "json-nodes", nodes, true
+		}
+	}
+	return "", nil, false
+}
+
+func decodeMaybeBase64JSON(body []byte) ([]byte, bool) {
+	s := strings.TrimSpace(string(body))
+	if len(s) < 8 || strings.HasPrefix(s, "{") || strings.HasPrefix(s, "[") {
+		return nil, false
+	}
+	compact := strings.Map(func(r rune) rune {
+		if r == '\r' || r == '\n' || r == ' ' || r == '\t' {
+			return -1
+		}
+		return r
+	}, s)
+	for _, enc := range []*base64.Encoding{base64.RawStdEncoding, base64.StdEncoding, base64.RawURLEncoding, base64.URLEncoding} {
+		b, err := enc.DecodeString(compact)
+		if err != nil {
+			continue
+		}
+		b = bytes.TrimSpace(b)
+		if len(b) > 1 && (b[0] == '{' || b[0] == '[') && json.Valid(b) {
+			return b, true
+		}
+	}
+	return nil, false
+}
+
+func collectJSONNodes(root interface{}, subID string) []ServerEntry {
+	var out []ServerEntry
+	seen := map[string]bool{}
+	counter := 0
+	addURI := func(raw string) {
+		raw = strings.TrimSpace(raw)
+		if raw == "" || seen[raw] {
+			return
+		}
+		proxy, err := parseProxyURI(raw)
+		if err != nil {
+			return
+		}
+		seen[raw] = true
+		counter++
+		name := stringValue(proxy["name"])
+		if name == "" {
+			name = fmt.Sprintf("Node %d", counter)
+		}
+		out = append(out, ServerEntry{ID: fmt.Sprintf("%s-j%d", safeID(subID), counter), Name: name, URI: raw, SourceSub: subID, Proxy: proxy})
+	}
+	addRaw := func(kind string, m map[string]interface{}) {
+		fingerprint, _ := json.Marshal(m)
+		key := kind + ":" + string(fingerprint)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		counter++
+		name := stringValue(m["tag"])
+		if name == "" {
+			name = stringValue(m["name"])
+		}
+		if name == "" {
+			if kind == "sing-box" {
+				name = stringValue(m["type"])
+			} else {
+				name = stringValue(m["protocol"])
+			}
+		}
+		if name == "" {
+			name = fmt.Sprintf("Node %d", counter)
+		}
+		out = append(out, ServerEntry{ID: fmt.Sprintf("%s-j%d", safeID(subID), counter), Name: name, SourceSub: subID, RawKind: kind, Raw: cloneMap(m)})
+	}
+
+	var walk func(interface{}, int)
+	walk = func(v interface{}, depth int) {
+		if depth > 6 || len(out) > 5000 {
+			return
+		}
+		switch x := v.(type) {
+		case string:
+			lower := strings.ToLower(strings.TrimSpace(x))
+			if strings.HasPrefix(lower, "vless://") || strings.HasPrefix(lower, "vmess://") || strings.HasPrefix(lower, "trojan://") || strings.HasPrefix(lower, "hysteria2://") || strings.HasPrefix(lower, "hy2://") || strings.HasPrefix(lower, "ss://") || strings.HasPrefix(lower, "socks://") || strings.HasPrefix(lower, "socks5://") {
+				addURI(x)
+			}
+		case []interface{}:
+			for _, item := range x {
+				walk(item, depth+1)
+			}
+		case map[string]interface{}:
+			// URI-like fields used by several subscription JSON dialects.
+			for _, key := range []string{"uri", "url", "link", "share", "shareLink", "serverLink"} {
+				if s, ok := x[key].(string); ok {
+					addURI(s)
+				}
+			}
+			typ := strings.ToLower(stringValue(x["type"]))
+			protocol := strings.ToLower(stringValue(x["protocol"]))
+			if typ != "" && typ != "direct" && typ != "block" && typ != "selector" && typ != "urltest" && typ != "dns" && (x["server"] != nil || x["server_port"] != nil || x["port"] != nil) {
+				addRaw("sing-box", x)
+				return
+			}
+			if protocol != "" && protocol != "freedom" && protocol != "blackhole" && protocol != "dns" {
+				addRaw("xray", x)
+				return
+			}
+			// Common containers. Walking all values as a fallback also catches
+			// vendor-specific wrappers while the depth/node limits prevent abuse.
+			preferred := false
+			for _, key := range []string{"outbounds", "nodes", "servers", "proxies", "items", "profiles", "configs", "data"} {
+				if child, ok := x[key]; ok {
+					preferred = true
+					walk(child, depth+1)
+				}
+			}
+			if !preferred {
+				for _, child := range x {
+					walk(child, depth+1)
+				}
+			}
+		}
+	}
+	walk(root, 0)
+	return out
+}
